@@ -53,6 +53,8 @@
 | **精细化请求调优** | 协议选择、推理/思考（Reasoning）参数设置、上下文/输出长度限制、自定义请求头、超时控制、自动重试、回退模型（Fallback）及熔断器（Circuit Breaker）。 |
 | **选择子代理模型** | 内置模型或自定义模型均可通过 `invoke_subagent` 将任务委派给已配置并启用的模型；并行子代理的路由相互独立，切换服务商时保留原始工具调用历史。[配置说明](docs/configuration.md#subagent-model-selection)。 |
 | **Google 账号池支持** | 使用受识别的 IDE **2.5.5** 安装通过 **Antigravity account** 登录，或使用自己的 OAuth 客户端；支持项目准备、凭据加密存储、配额检查、自适应账号选择及模型级别的冷却时间。[真实登录、令牌刷新与生成验证结果](docs/configuration.md#verified-google-account-flow)。 |
+| **账号卡片管理** | 可折叠面板支持启用/停用账号、修改标签、从池中移除及 Preferred/Automatic 切换。各池的项目与配额独立保留；套餐标识仅使用提供商返回的数据。Native fallback 开关仅使用模型精确匹配的 Cloud Code 池，不转向公开 Gemini API。[详情](docs/configuration.md#quota-panel-and-preferred-accounts)。 |
+| **可见上下文估算** | 识别到原生模型选择器后，只读圆环以 `~` 标记估算、以 `?` 标记用量未知。隐藏提示词、工具定义和图片不计入。优先采用已配置的上下文上限；点击后可通过有时间和大小限制的公开 models.dev 目录查询缺失上限，不修改配置。[估算范围](docs/configuration.md#native-context-estimate)。 |
 | **直连请求诊断** | 内置诊断工具，可查看近期请求、实测延迟/Token 消耗，并提供显式的轻量生成测试。 |
 | **连接 Antigravity IDE** | 可逆的设置适配器、托管代理启动器与浏览器端模型管理器；已在 Windows IDE 2.5.5 上配合本地 OpenAI 兼容服务商验证原生模型选择器与流式对话。[查看配置指南](docs/ide.md)。 |
 | **保持原生模型选择稳定** | 为模型别名和推理强度变体提供持久、无冲突的 ID，并支持明确的[原生选择器容量管理](docs/ide.md#native-model-identities-and-capacity)。 |

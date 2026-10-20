@@ -703,10 +703,16 @@ export function createModelManager(
       }
       return updateGoogleModels(changed, resetIds);
     },
-    googleSelectAccount(input: { modelName: string; accountId: string }) {
+    googleSelectAccount(input: { modelName: string; accountId?: string }) {
       const changed = googleModels().filter((model) => model.name === input.modelName && Array.isArray(model.googleAccounts) &&
-        (model.googleAccounts as GoogleAccount[]).some((account) => account.id === input.accountId && account.enabled !== false));
-      for (const model of changed) model.googlePool = { ...(model.googlePool as GooglePoolOptions || {}), preferredAccountId: input.accountId };
+        (input.accountId === undefined ||
+          (model.googleAccounts as GoogleAccount[]).some((account) => account.id === input.accountId && account.enabled !== false)));
+      for (const model of changed) {
+        const pool = { ...(model.googlePool as GooglePoolOptions || {}) };
+        if (input.accountId === undefined) delete pool.preferredAccountId;
+        else pool.preferredAccountId = input.accountId;
+        model.googlePool = pool;
+      }
       return updateGoogleModels(changed, []);
     },
     googleRemoveAccount(input: { modelName: string; accountId: string }) {

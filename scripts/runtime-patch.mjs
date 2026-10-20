@@ -221,29 +221,32 @@ function patchLanguageServer(bytes) {
   return applyEdits(file, source, edits);
 }
 
-function patchPreload(vendorBytes, customBytes) {
+function patchPreload(vendorBytes, augmentations) {
   const file = 'dist/preload.js';
   const { source } = parse(file, vendorBytes);
-  const custom = parse('customPreload.js', customBytes);
-  for (const node of matching(custom.tree, (node) => ts.isCallExpression(node))) {
-    if (
-      ts.isIdentifier(node.expression) &&
-      node.expression.text === 'require' &&
-      (node.arguments.length !== 1 || !ts.isStringLiteral(node.arguments[0]) || node.arguments[0].text !== 'electron')
-    ) {
-      unsupported('customPreload.js', 'sandboxed custom preload may only require electron');
+  const additions = augmentations.map(({ name, bytes }) => {
+    const custom = parse(name, bytes);
+    for (const node of matching(custom.tree, (node) => ts.isCallExpression(node))) {
+      if (
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === 'require' &&
+        (node.arguments.length !== 1 || !ts.isStringLiteral(node.arguments[0]) || node.arguments[0].text !== 'electron')
+      ) {
+        unsupported(name, 'sandboxed custom preload may only require electron');
+      }
+      if (
+        (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'exposeInMainWorld') ||
+        node.expression.kind === ts.SyntaxKind.ImportKeyword
+      ) {
+        unsupported(name, 'custom preload must not redeclare vendor bridges or import other modules');
+      }
     }
-    if (
-      (ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === 'exposeInMainWorld') ||
-      node.expression.kind === ts.SyntaxKind.ImportKeyword
-    ) {
-      unsupported('customPreload.js', 'custom preload must not redeclare vendor bridges or import other modules');
-    }
-  }
+    return `\n(() => {\nconst exports = {};\n${custom.source}\n})();\n`;
+  });
   return applyEdits(file, source, [
     {
       start: source.length,
-      text: `\n;${MARKER}\n(() => {\nconst exports = {};\n${custom.source}\n})();\n`,
+      text: `\n;${MARKER}\n${additions.join('')}`,
     },
   ]);
 }
@@ -259,7 +262,10 @@ export function planRuntimePatch(readVendorFile, readBuildFile) {
     ['dist/languageServer.js', patchLanguageServer(readInput(readVendorFile, 'dist/languageServer.js'))],
     [
       'dist/preload.js',
-      patchPreload(readInput(readVendorFile, 'dist/preload.js'), readInput(readBuildFile, 'customPreload.js')),
+      patchPreload(
+        readInput(readVendorFile, 'dist/preload.js'),
+        ['customPreload.js', 'contextUsagePreload.js'].map((name) => ({ name, bytes: readInput(readBuildFile, name) })),
+      ),
     ],
   ]);
 }

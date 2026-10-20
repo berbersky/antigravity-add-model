@@ -661,9 +661,16 @@ function createModelManager(directory, codec, openExternal, overrides = {}) {
         },
         googleSelectAccount(input) {
             const changed = googleModels().filter((model) => model.name === input.modelName && Array.isArray(model.googleAccounts) &&
-                model.googleAccounts.some((account) => account.id === input.accountId && account.enabled !== false));
-            for (const model of changed)
-                model.googlePool = { ...(model.googlePool || {}), preferredAccountId: input.accountId };
+                (input.accountId === undefined ||
+                    model.googleAccounts.some((account) => account.id === input.accountId && account.enabled !== false)));
+            for (const model of changed) {
+                const pool = { ...(model.googlePool || {}) };
+                if (input.accountId === undefined)
+                    delete pool.preferredAccountId;
+                else
+                    pool.preferredAccountId = input.accountId;
+                model.googlePool = pool;
+            }
             return updateGoogleModels(changed, []);
         },
         googleRemoveAccount(input) {

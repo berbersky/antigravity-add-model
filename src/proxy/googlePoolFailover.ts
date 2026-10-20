@@ -51,10 +51,10 @@ export function resolveGoogleFailoverPool(models: PoolModel[], body: Buffer): Po
   return matches.length === 1 ? matches[0] : undefined;
 }
 
-/** HTTP 403 is a quota failure only with a structured, explicit Google rate-limit diagnosis. */
+/** HTTP 400/403 require a structured, explicit Google rate-limit diagnosis. */
 export function isGoogleQuotaFailure(status: number, body: string): boolean {
   if (status === 429) return true;
-  if (status !== 403) return false;
+  if (status !== 400 && status !== 403) return false;
   try {
     const value = JSON.parse(body);
     const error = value?.error || value;
@@ -88,6 +88,9 @@ export async function attemptGooglePoolFailover(
 ): Promise<boolean> {
   const unavailable = () => res.destroyed || res.writableEnded || options.isStopping?.();
   if (unavailable()) return true;
+  // Public Gemini and Cloud Code use different request/response envelopes. Only native
+  // Cloud Code requests can be replayed without a complete protocol adapter.
+  if (!/^\/v1internal:(?:streamGenerateContent|generateContent)(?:\?|$)/.test(req.url || '')) return false;
   if (!isGoogleQuotaFailure(errorRes.statusCode || 500, errorBody)) return false;
   const pool = resolveGoogleFailoverPool(options.loadCustomModels(), reqBody);
   const body = parsedRequest(reqBody);
@@ -100,11 +103,16 @@ export async function attemptGooglePoolFailover(
   const decision = classifyGoogleRateLimit(errorBody, errorRes.headers['retry-after']);
   if (failingAccount)
     recordGoogleAccountFailure(
-      failingAccount,
+      {
+        ...failingAccount,
+        project: typeof body.project === 'string' ? body.project : undefined,
+        cloudCodeEndpoint: undefined,
+      },
       errorRes.statusCode!,
       decision.retryAfterMs ?? pool.googlePool?.cooldownMs,
       upstreamModel,
       decision.reason,
+      cloudCodeOrigin,
     );
   let candidates = pool.googleAccounts!.filter(
     (account) => account.enabled !== false && account.id !== failingAccount?.id,
@@ -141,7 +149,14 @@ export async function attemptGooglePoolFailover(
           };
           abandonAcquire = cancelAcquire;
           controller.signal.addEventListener('abort', cancelAcquire, { once: true });
-          void acquireGoogleAccount(pool.name, candidates, pool.googlePool, identity, upstreamModel).then(
+          void acquireGoogleAccount(
+            pool.name,
+            candidates,
+            pool.googlePool,
+            identity,
+            upstreamModel,
+            pool.apiUrl || cloudCodeOrigin,
+          ).then(
             (value) => {
               controller.signal.removeEventListener('abort', cancelAcquire);
               if (abandoned || unavailable() || controller.signal.aborted) {
@@ -242,7 +257,7 @@ export async function attemptGooglePoolFailover(
                 if (!upstream.complete) fail();
               });
               const status = upstream.statusCode || 502;
-              if ([401, 403, 408, 429].includes(status) || status >= 500) {
+              if ([400, 401, 403, 408, 429].includes(status) || status >= 500) {
                 const chunks: Buffer[] = [];
                 let size = 0;
                 upstream.on('data', (chunk: Buffer) => {
@@ -254,6 +269,12 @@ export async function attemptGooglePoolFailover(
                   const text = Buffer.concat(chunks).toString('utf8');
                   const limited = isGoogleQuotaFailure(status, text);
                   const limit = limited ? classifyGoogleRateLimit(text, upstream.headers['retry-after']) : undefined;
+                  if (status === 400 && !limited) {
+                    res.writeHead(status, options.forwardingHeaders(upstream.headers));
+                    res.end(Buffer.concat(chunks));
+                    finish(true, { status });
+                    return;
+                  }
                   finish(false, { status, retryAfterMs: limit?.retryAfterMs, cooldownReason: limit?.reason });
                 });
                 return;

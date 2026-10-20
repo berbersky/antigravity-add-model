@@ -53,6 +53,27 @@ Missing metadata keeps the normal defaults; review limits and capabilities for
 your chosen model. Discovery does not generate a completion or verify tool use.
 See [providers and model catalogs](providers.md) for endpoints and service-specific details.
 
+## Native context estimate
+
+On recognized native chat layouts, a small read-only ring appears beside the
+model selector. Hover or focus it for details. `~` means an estimate from the
+identified conversation's local transcript; `?` means usage is unavailable,
+including when the conversation cannot be identified or its transcript cannot
+be read reliably. Unknown usage is not displayed as zero.
+
+The estimate counts recorded text, reasoning and tool-call text since the latest
+structured checkpoint, using a character-based approximation. Hidden prompts,
+tool definitions and image token costs are excluded. Actual provider usage can
+be higher; the ring is not a measured token percentage, remaining-credit display,
+or guarantee that the next request will fit.
+
+An explicitly configured `contextWindow` takes priority. If the limit is missing,
+clicking the ring can retrieve the public `models.dev` catalog with bounded time
+and response size. Matching happens locally; the catalog request does not include
+conversation text, credentials or the selected model name. Missing or ambiguous
+limits remain unknown. This lookup and the transcript reader never change model
+configuration, rewrite transcripts or trigger a generation request.
+
 ## Image inputs
 
 Choose a model and endpoint that actually support image understanding. Discovery
@@ -336,7 +357,7 @@ the IDE's existing Google session.
 2. Click **Sign in with Google** and complete browser consent. Both sign-in methods use [installed-app OAuth](https://developers.google.com/identity/protocols/oauth2/native-app) with PKCE, state validation and a temporary loopback callback. Antigravity mode uses the recognized app's scope set; custom mode requests `cloud-platform`. Browser sign-in expires after two minutes and can be cancelled.
 3. Antigravity sign-in then prepares the account's Cloud Code project and service endpoint. If first-time enrollment is needed, this explicit action can request the **free tier only**; Google still decides eligibility. It does not enroll in a paid tier. Wait for preparation to finish before saving.
 4. Repeat for each account, then **Save model** within **10 minutes** of each successful sign-in. You can also fetch the catalog and **Add selected** to save several models with the same account. Saving one model no longer consumes the pending credentials needed by the remaining selections, and does not extend their original expiry. Pending credentials stay in main-process memory; the UI receives masked fields. Saved tokens and client secrets are encrypted. Sign in again if an unsaved entry expires.
-5. Use **Test account** for access and quota, **Fetch provider models** for the catalog, and **Test generation** for a short model response. These check different things: successful login, project preparation or model listing does not establish successful generation. **Pool status** shows the current state; quota refresh is explicit, not periodic.
+5. Use **Test account** for access and quota, **Fetch provider models** for the catalog, and **Test generation** for a short model response. These check different things: successful login, project preparation or model listing does not establish successful generation. **Pool status** shows the current state; the fleet panel also refreshes quota as described below.
 
 To keep using your own client, select **My Desktop OAuth client**, enter its
 client ID and optional secret, and configure Google's **Desktop app** consent
@@ -381,37 +402,57 @@ Structured Google `RetryInfo` / `ErrorInfo` hints and `Retry-After` take precede
 over the configured cooldown (bounded to 31 days). Cooldowns use the upstream
 model ID, so local effort variants share the same limit. A cooldown does not
 block a different upstream model using that account; authentication failures and
-concurrency capacity remain account-wide. A quota snapshot disables an account
-globally only when all returned fresh buckets explicitly report zero. One empty
-Claude bucket must not disable a positive Gemini bucket. No refill time is guessed.
+concurrency capacity remain account-wide. Quota eligibility stays scoped to the
+account, OAuth client, project and endpoint that produced the measurement. A
+snapshot with every fresh bucket explicitly at zero makes that scope unavailable;
+one empty Claude bucket must not disable a positive Gemini bucket. No refill time
+is guessed.
 
 ### Quota panel and preferred accounts
 
 The Google account panel is available in desktop settings and the IDE's browser
-model manager. It groups the provider's quota buckets and shows supplied reset
-times. Unknown quota stays unknown; refreshing a card does not
-generate a completion or purchase additional quota. Each account is queried
-through the saved model that owns it, including when multiple pools are present.
-When Google returns both grouped and top-level buckets, both sets are displayed;
-distinct model families and quota windows are retained.
+model manager. Its collapsible account cards show a separate tile for every
+assigned model pool, with its project, grouped quota buckets and relative reset
+times; hover a reset time for the absolute date. Plan badges appear only when
+Google reports the plan. Unknown quota and missing plans are not inferred from
+bucket names, reset windows or other accounts.
 
-A shared email appears in one account row with every assigned model pool below
-it. Email matching ignores case and surrounding whitespace; accounts without a
-known email use their saved account ID. Each pool keeps its own account ID,
-credentials, project, quota query and controls, so grouping does not transfer
-quota or preferences between models.
+A shared known email appears in one account card. Matching ignores case and
+surrounding whitespace; memberships without a known email remain separate.
+Every pool retains its own account ID, credentials, project, endpoint and quota
+query. Even identically named buckets in different pools remain visible, so one
+project's available quota cannot conceal another project's exhausted quota.
+When Google returns both grouped and top-level buckets, distinct model families
+and quota windows are retained.
+
+While the fleet panel is mounted, it checks freshness every 30 seconds and reuses
+each pool's result for up to two minutes. **Refresh quotas** forces new queries
+and displays progress. Queries run sequentially through each owning model.
+Refreshing does not generate a completion or purchase additional quota.
+
+**Disable account** and **Enable account** affect the card's memberships while
+preserving other accounts; a pool is disabled when no enabled account remains.
+**Edit label** changes only labels across those memberships. Use a pool's editor
+for its credentials and project. **Remove from fleet** asks for confirmation,
+then detaches the account from its assigned pools without deleting model
+definitions or other accounts. Per-pool **Remove** remains available.
 
 **Use preferred** saves `googlePool.preferredAccountId` for that pool. The chosen
 account is preferred only while enabled, authenticated and eligible for the
 requested upstream model; quota, cooldown and concurrency limits still apply.
+**Automatic** clears that preference and returns to the pool's selection strategy.
 **Reconnect** stores the new OAuth credentials while retaining the account ID.
 Account removal affects the selected pool, and other saved models remain intact.
 
-Set `googlePool.nativeFailoverEnabled` to `true` in the model editor to let native
+The **Native Google request fallback** switch applies to all Google Cloud Code
+pools; a mixed indicator means only some pools are enabled. To configure one
+pool, set `googlePool.nativeFailoverEnabled` in its model editor. Enabling it lets native
 Google generation retry through that saved pool after a confirmed quota/rate-limit
 response. This is off by default. The saved `externalModelName` must match the
 native request's model ID, and exactly one enabled opted-in pool must match.
 Ambiguous configurations do not merge accounts or choose a pool arbitrarily.
+Only Cloud Code requests and Cloud Code account pools participate; this switch
+does not translate retries to the public Gemini API or another provider.
 Retries use at most three eligible accounts and retain cancellation, deadlines,
 scoped cooldowns and concurrency limits until the response completes. Permission
 denials without a structured quota diagnosis do not trigger this behavior.

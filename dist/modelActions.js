@@ -38,6 +38,7 @@ const diagnostics_1 = require("./diagnostics");
 const path = __importStar(require("node:path"));
 const modelIdentity_1 = require("./modelIdentity");
 const modelUtils_1 = require("./proxy/modelUtils");
+const chatContext_1 = require("./chatContext");
 function createModelActions(manager) {
     return {
         'storage:get-custom-models': () => {
@@ -110,6 +111,7 @@ function createModelActions(manager) {
         'storage:google-remove-account': manager.googleRemoveAccount,
         'storage:get-diagnostics': diagnostics_1.getDiagnostics,
         'storage:clear-diagnostics': diagnostics_1.clearDiagnostics,
+        'storage:get-chat-context-usage': (payload) => (0, chatContext_1.getContextInformation)(payload, path.dirname(manager.store.filename), manager.store.list()),
     };
 }
 //# sourceMappingURL=modelActions.js.map

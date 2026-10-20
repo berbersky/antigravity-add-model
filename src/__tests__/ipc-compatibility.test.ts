@@ -18,7 +18,7 @@ type State = { type: string; update?: { version: string } };
 // Execute the production CommonJS modules with an explicit Electron boundary.
 // No app, updater, shell or network operation runs here; model files use isolated temporary homes.
 const compiled = new Map(
-  ['updater', 'ipcHandlers', 'customIpc', 'preload', 'customPreload'].map((name) => [
+  ['updater', 'ipcHandlers', 'customIpc', 'preload', 'customPreload', 'contextUsagePreload'].map((name) => [
     name,
     ts.transpileModule(readFileSync(path.resolve('src', `${name}.ts`), 'utf8'), {
       compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true },
@@ -123,7 +123,8 @@ function createFixture(customOnly = false) {
   }
   const globals = { window: { addEventListener: vi.fn() } };
   const customPreload = loadModule('customPreload', dependencies, globals);
-  if (!customOnly) loadModule('preload', { ...dependencies, './customPreload': customPreload }, globals);
+  const contextUsagePreload = loadModule('contextUsagePreload', dependencies, globals);
+  if (!customOnly) loadModule('preload', { ...dependencies, './customPreload': customPreload, './contextUsagePreload': contextUsagePreload }, globals);
   return {
     handlers,
     invoke: electron.ipcRenderer.invoke,
@@ -276,6 +277,7 @@ describe('standalone custom model addon', () => {
       'storage:google-remove-account',
       'storage:get-diagnostics',
       'storage:clear-diagnostics',
+      'storage:get-chat-context-usage',
     ]);
     expect(fixture.exposed).toEqual({});
   });

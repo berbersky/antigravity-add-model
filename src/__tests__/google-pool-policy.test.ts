@@ -57,4 +57,15 @@ describe('Google structured rate limit policy', () => {
     expect(decision.retryAfterMs).toBe(31 * 24 * 3_600_000);
     expect(JSON.stringify(decision)).not.toContain(secret);
   });
+  it('reads complete reset durations from bounded error messages without truncating spaced components', () => {
+    expect(classifyGoogleRateLimit(error([], 'Individual quota exceeded. Resets in 1h 30m 0.5s.'))).toEqual({
+      reason: 'quota-exhausted',
+      retryAfterMs: 5_400_500,
+    });
+    expect(classifyGoogleRateLimit(error([], 'Quota exceeded. Resets in 0h 53m.')).retryAfterMs).toBe(3_180_000);
+    expect(classifyGoogleRateLimit(error([], 'Resets in 1hour'))).toEqual({ reason: 'rate-limited' });
+    expect(
+      classifyGoogleRateLimit(JSON.stringify({ request: { prompt: 'Resets in 1h' }, error: {} })).retryAfterMs,
+    ).toBeUndefined();
+  });
 });

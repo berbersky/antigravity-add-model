@@ -54,8 +54,11 @@ export async function startStandaloneService(
   };
   const actions = createModelActions(manager);
   const handleDelegation = createModelDelegation(loadCustomModels);
-  const preload = fs.readFileSync(path.join(__dirname, 'customPreload.js'), 'utf8');
-  const appScript = `${BRIDGE}\n(function(exports,require){\n${preload}\n})({},name=>{if(name==='electron')return {ipcRenderer:bridge};throw new Error('Unsupported module');});`;
+  const augmentations = ['customPreload.js', 'contextUsagePreload.js'].map((name) => {
+    const preload = fs.readFileSync(path.join(__dirname, name), 'utf8');
+    return `(function(exports,require){\n${preload}\n})({},name=>{if(name==='electron')return {ipcRenderer:bridge};throw new Error('Unsupported module');});`;
+  });
+  const appScript = `${BRIDGE}\n${augmentations.join('\n')}`;
   const respond = (res: http.ServerResponse, status: number, value: unknown) => {
     res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
     res.end(JSON.stringify(value));

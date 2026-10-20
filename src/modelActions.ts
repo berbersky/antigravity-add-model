@@ -4,6 +4,7 @@ import { getDiagnostics, clearDiagnostics, getRecentModelNames } from './diagnos
 import * as path from 'node:path';
 import { allocateModelIdentities } from './modelIdentity';
 import { nativeCatalogCapabilities, nativeModelExperiments, type CustomModelConfig } from './proxy/modelUtils';
+import { getContextInformation } from './chatContext';
 
 export function createModelActions(
   manager: ReturnType<typeof createModelManager>,
@@ -78,5 +79,7 @@ export function createModelActions(
     'storage:google-remove-account': manager.googleRemoveAccount,
     'storage:get-diagnostics': getDiagnostics,
     'storage:clear-diagnostics': clearDiagnostics,
+    'storage:get-chat-context-usage': (payload?: unknown) =>
+      getContextInformation(payload, path.dirname(manager.store.filename), manager.store.list()),
   };
 }

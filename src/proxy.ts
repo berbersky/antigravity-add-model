@@ -125,6 +125,7 @@ import {
   stateTimestamps,
   startCleanupInterval,
   stopCleanupInterval,
+  recordOfficialQuota,
 } from './proxy/shared';
 
 // Model configuration & capability detection
@@ -580,7 +581,10 @@ function forwardToGoogle(
     res.end(JSON.stringify({ error: { message } }));
   };
   const proxyReq = https.request(parsedUrl, options, (proxyRes) => {
-    if (failoverEnabled && (proxyRes.statusCode === 429 || proxyRes.statusCode === 403)) {
+    if (
+      failoverEnabled &&
+      (proxyRes.statusCode === 429 || proxyRes.statusCode === 403 || proxyRes.statusCode === 400)
+    ) {
       const chunks: Buffer[] = [];
       let bytes = 0;
       let interrupted = false;
@@ -600,19 +604,30 @@ function forwardToGoogle(
       proxyRes.once('end', () => {
         if (interrupted) return;
         const original = Buffer.concat(chunks);
-        void attemptGooglePoolFailover(req, res, reqBody, proxyRes, original.toString('utf8'), {
-          loadCustomModels,
-          forwardingHeaders,
-          trackUpstream,
-          isStopping: () => !!stoppingProxy,
-          log,
-        }, nativeSubagent, cloudCodeOrigin || targetUrl).then((handled) => {
-          if (handled || stoppingProxy || res.destroyed || res.writableEnded) return;
-          const responseHeaders = forwardingHeaders(proxyRes.headers);
-          responseHeaders['content-length'] = String(original.length);
-          res.writeHead(proxyRes.statusCode || 429, responseHeaders);
-          res.end(original);
-        }).catch(() => failForwarding(502, 'Google account failover failed.'));
+        void attemptGooglePoolFailover(
+          req,
+          res,
+          reqBody,
+          proxyRes,
+          original.toString('utf8'),
+          {
+            loadCustomModels,
+            forwardingHeaders,
+            trackUpstream,
+            isStopping: () => !!stoppingProxy,
+            log,
+          },
+          nativeSubagent,
+          cloudCodeOrigin || targetUrl,
+        )
+          .then((handled) => {
+            if (handled || stoppingProxy || res.destroyed || res.writableEnded) return;
+            const responseHeaders = forwardingHeaders(proxyRes.headers);
+            responseHeaders['content-length'] = String(original.length);
+            res.writeHead(proxyRes.statusCode || 429, responseHeaders);
+            res.end(original);
+          })
+          .catch(() => failForwarding(502, 'Google account failover failed.'));
       });
       return;
     }
@@ -655,6 +670,31 @@ function forwardToGoogle(
             cloudCodeRouting.observe(req.headers, proxyRes.statusCode || 500, JSON.parse(text));
           } catch {
             /* Invalid responses must not change the account's upstream routing. */
+          }
+        }
+
+        if (parsedUrl.pathname === '/v1internal:retrieveUserQuotaSummary' && proxyRes.statusCode === 200) {
+          try {
+            const authorization = req.headers.authorization;
+            const token = typeof authorization === 'string' ? authorization.replace(/^Bearer\s+/i, '').trim() : '';
+            const request = JSON.parse(reqBody.toString('utf8')) as Record<string, unknown>;
+            const project = typeof request.project === 'string' ? request.project : undefined;
+            if (token) {
+              for (const model of loadCustomModels()) {
+                if (model.provider !== 'google-cloudcode') continue;
+                for (const account of model.googleAccounts || []) {
+                  if (account.accessToken?.trim() !== token) continue;
+                  recordOfficialQuota(JSON.parse(text), {
+                    accountId: account.id,
+                    clientId: account.clientId,
+                    project,
+                    endpoint: parsedUrl.origin,
+                  });
+                }
+              }
+            }
+          } catch {
+            /* Unattributed or malformed quota responses must not change saved account measurements. */
           }
         }
 

@@ -58,16 +58,16 @@ async function fixture(
   });
   openWindows.push(dom);
   await new Promise<void>((done) => dom.window.addEventListener('DOMContentLoaded', () => done(), { once: true }));
-  let models = initialModels.map((value) => ({ ...value }));
+  let models = structuredClone(initialModels);
   const handlers: Record<string, (...args: any[]) => unknown> = {
-    'storage:get-custom-models': () => models.map((entry) => ({ ...entry })),
+    'storage:get-custom-models': () => structuredClone(models),
     'storage:get-provider-presets': () => presets,
     'storage:save-custom-model': (entry) => {
       const index = models.findIndex(
         (value) => value.name === (entry.copyFrom ? entry.name : entry.originalName || entry.name),
       );
-      if (index < 0) models.push({ ...entry });
-      else models[index] = { ...entry };
+      if (index < 0) models.push(structuredClone(entry));
+      else models[index] = structuredClone(entry);
       return { success: true };
     },
     'storage:delete-custom-model': (name) => {
@@ -156,8 +156,23 @@ async function fixture(
     }),
     'storage:google-pool-status': () => ({ success: true, accounts: [{ id: 'saved-account', inFlight: 0 }] }),
     'storage:google-link-account': () => ({ success: true }),
-    'storage:google-select-account': () => ({ success: true }),
-    'storage:google-remove-account': () => ({ success: true }),
+    'storage:google-select-account': ({ modelName, accountId }) => {
+      const entry = models.find((model) => model.name === modelName)!;
+      const pool = { ...(entry.googlePool as Record<string, unknown> || {}) };
+      if (accountId) pool.preferredAccountId = accountId;
+      else delete pool.preferredAccountId;
+      entry.googlePool = pool;
+      return { success: true };
+    },
+    'storage:google-remove-account': ({ modelName, accountId }) => {
+      const entry = models.find((model) => model.name === modelName)!;
+      const accounts = (entry.googleAccounts as { id: string; enabled?: boolean }[]).filter((account) => account.id !== accountId);
+      entry.googleAccounts = accounts;
+      if (!accounts.some((account) => account.enabled !== false)) entry.enabled = false;
+      const pool = entry.googlePool as { preferredAccountId?: string } | undefined;
+      if (pool?.preferredAccountId === accountId) delete pool.preferredAccountId;
+      return { success: true };
+    },
   };
   const invoke = vi.fn(async (channel: string, ...args: unknown[]) => {
     if (!handlers[channel]) throw new Error(`Unexpected IPC: ${channel}`);
@@ -412,7 +427,7 @@ describe('custom model settings in the preserved vendor preload', () => {
 
   it('saves and clears compaction effort independently of normal reasoning settings', async () => {
     const f = await fixture(undefined, [{ ...model, reasoningEffort: 'xhigh', thinkingBudget: 8192 }]);
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     expect(f.input('agy-compaction-effort').value).toBe('');
     f.input('agy-compaction-effort', 'low');
     await f.click('Save model');
@@ -421,7 +436,7 @@ describe('custom model settings in the preserved vendor preload', () => {
       thinkingBudget: 8192,
       compactionReasoningEffort: 'low',
     });
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     expect(f.input('agy-compaction-effort').value).toBe('low');
     expect(f.input('agy-reasoning-effort').value).toBe('xhigh');
     expect(f.input('agy-thinking-budget').value).toBe('8192');
@@ -432,13 +447,13 @@ describe('custom model settings in the preserved vendor preload', () => {
       thinkingBudget: 8192,
       compactionReasoningEffort: 'none',
     });
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     expect(f.input('agy-compaction-effort').value).toBe('none');
     f.input('agy-compaction-effort', '');
     await f.click('Save model');
     expect(f.getModels()[0]).toMatchObject({ reasoningEffort: 'xhigh', thinkingBudget: 8192 });
     expect(f.getModels()[0].compactionReasoningEffort).toBeUndefined();
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     expect(f.input('agy-compaction-effort').value).toBe('');
     expect(f.input('agy-reasoning-effort').value).toBe('xhigh');
     expect(f.input('agy-thinking-budget').value).toBe('8192');
@@ -449,7 +464,7 @@ describe('custom model settings in the preserved vendor preload', () => {
       ...model, contextWindow: 85000, maxOutputTokens: 8192,
       reasoningEffort: 'xhigh', compactionReasoningEffort: 'low',
     }]);
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     expect(f.input('agy-compaction-threshold').value).toBe('');
     expect(f.input('agy-compaction-threshold').min).toBe('10');
     expect(f.input('agy-compaction-threshold').max).toBe('90');
@@ -459,7 +474,7 @@ describe('custom model settings in the preserved vendor preload', () => {
       compactionThresholdPercent: 80, contextWindow: 85000, maxOutputTokens: 8192,
       reasoningEffort: 'xhigh', compactionReasoningEffort: 'low',
     });
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     expect(f.input('agy-compaction-threshold').value).toBe('80');
     f.input('agy-compaction-threshold', '');
     await f.click('Save model');
@@ -469,7 +484,7 @@ describe('custom model settings in the preserved vendor preload', () => {
 
   it.each(['9', '91', '50.5'])('rejects out-of-range or fractional native compaction thresholds: %s', async (value) => {
     const f = await fixture(undefined, [{ ...model, contextWindow: 85000, maxOutputTokens: 8192 }]);
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     f.input('agy-compaction-threshold', value);
     await f.click('Save model');
     expect(f.invoke.mock.calls.filter(([channel]) => channel === 'storage:save-custom-model')).toHaveLength(0);
@@ -478,7 +493,7 @@ describe('custom model settings in the preserved vendor preload', () => {
 
   it('requires the real context window before saving a native threshold', async () => {
     const f = await fixture();
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     f.input('agy-compaction-threshold', '80');
     await f.click('Save model');
     expect(f.invoke.mock.calls.filter(([channel]) => channel === 'storage:save-custom-model')).toHaveLength(0);
@@ -489,7 +504,7 @@ describe('custom model settings in the preserved vendor preload', () => {
     const f = await fixture(undefined, [
       { ...model, provider: 'google-cloudcode', googlePool: { strategy: 'quota' }, googleAccounts: [] },
     ]);
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     const strategy = f.document.getElementById('agy-google-pool-strategy') as HTMLSelectElement;
     expect(strategy.value).toBe('quota');
     expect(Array.from(strategy.options).map((option) => option.value)).toContain('adaptive');
@@ -571,7 +586,7 @@ describe('custom model settings in the preserved vendor preload', () => {
       externalModelName: '@cf/text-model',
     };
     const f = await fixture(undefined, [existing]);
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     expect(f.input('agy-api-key').value).toBe('');
     await f.click('Test connection');
     await f.click('Fetch provider models');
@@ -593,7 +608,7 @@ describe('custom model settings in the preserved vendor preload', () => {
 
   it('edits and renames while roundtripping masked credentials and advanced options', async () => {
     const f = await fixture();
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     expect(f.input('agy-api-key').type).toBe('password');
     expect(f.input('agy-api-key').value).toBe('********');
     f.input('agy-model-name', 'models/renamed');
@@ -766,7 +781,7 @@ describe('custom model settings in the preserved vendor preload', () => {
 
   it('shows validation and backend errors, retaining the form so the user can correct it', async () => {
     const f = await fixture();
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     f.input('agy-custom-headers', '{"Authorization":42}');
     await f.click('Save model');
     expect(f.document.querySelector('[role="dialog"]')!.textContent).toContain('Custom header values must be strings');
@@ -837,7 +852,7 @@ describe('custom model settings in the preserved vendor preload', () => {
         googlePool: { strategy: 'quota', maxConcurrency: 3, cooldownMs: 90000 },
       },
     ]);
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     expect(f.document.getElementById('agy-google-account-config')!.hidden).toBe(false);
     expect(f.input('agy-api-key').closest('label')!.hidden).toBe(true);
     await f.click('Test account');
@@ -975,7 +990,7 @@ describe('custom model settings in the preserved vendor preload', () => {
         ],
       },
     ]);
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     expect(f.invoke.mock.calls.some(([channel]) => channel === 'storage:google-account-prepare')).toBe(false);
     await f.click('Prepare account');
     expect(f.invoke).toHaveBeenCalledWith('storage:google-account-prepare', {
@@ -1080,7 +1095,7 @@ describe('custom model settings in the preserved vendor preload', () => {
       finishPrepare({ success: false, error: 'Account preparation cancelled' });
       return { success: true };
     };
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     await f.click('Prepare account');
     await f.click('Close');
     expect(f.invoke).toHaveBeenCalledWith('storage:google-login-cancel');
@@ -1188,6 +1203,241 @@ describe('custom model settings in the preserved vendor preload', () => {
 
 describe('Google fleet and native picker search', () => {
   const pool = (name: string, id: string) => ({ ...model, name, provider:'google-cloudcode', googleAccounts:[{id,email:`${id}@example.com`,authMode:'antigravity'}] });
+  const member = (document: Document, modelName: string, id?: string) =>
+    [...document.querySelectorAll<HTMLElement>('.agy-fleet-pool')].find((node) =>
+      node.dataset.modelName === modelName && (!id || node.dataset.accountId === id))!;
+  const card = (document: Document, email: string) =>
+    [...document.querySelectorAll<HTMLElement>('.agy-fleet-table tbody > tr')].find((node) =>
+      node.dataset.accountIdentity === email)!;
+
+  it('keeps quota requests and visible measurements scoped to each project even for matching IDs', async () => {
+    const entries = ['one', 'two'].map((name) => ({ ...pool(`models/${name}`, 'shared'), googleAccounts: [{
+      id: 'shared', email: 'shared@example.com', project: `project-${name}`, authMode: 'antigravity',
+    }] }));
+    const f = await fixture(undefined, entries);
+    f.invoke.mockClear();
+    f.handlers['storage:google-test-account'] = ({ modelName }) => ({ success: true, quota: {
+      email: 'shared@example.com', planTier: modelName === entries[0].name ? 'Pro' : undefined,
+      buckets: [{ id: 'weekly', groupName: 'Gemini Models', remainingFraction: modelName === entries[0].name ? 0.8 : 0,
+        resetTime: new Date(Date.now() + 7_200_000).toISOString() }],
+    } });
+    await f.click('Refresh quotas');
+    expect(f.invoke.mock.calls.filter(([channel]) => channel === 'storage:google-test-account')).toHaveLength(2);
+    for (const [index, entry] of entries.entries()) {
+      const scope = member(f.document, entry.name);
+      const progress = scope.querySelector('progress')!;
+      expect(progress.value).toBe(index === 0 ? 0.8 : 0);
+      expect(progress.hidden).toBe(false);
+      expect(progress.style.display).not.toBe('none');
+      expect(scope.textContent).toContain(index === 0 ? '80% remaining' : '0% remaining');
+      expect(scope.textContent).toContain(`project-${index === 0 ? 'one' : 'two'}`);
+      expect(scope.textContent).toContain('Resets in');
+    }
+    expect(member(f.document, entries[1].name).textContent).not.toContain('Free');
+  });
+
+  it('never changes a known account identity using another pool quota response', async () => {
+    const entries = ['one', 'two'].map((name) => ({ ...pool(`models/${name}`, 'shared'), googleAccounts: [{
+      id: 'shared', email: `${name}@example.com`, authMode: 'antigravity',
+    }] }));
+    const f = await fixture(undefined, entries);
+    f.handlers['storage:google-test-account'] = ({ modelName }) => ({ success: true, quota: {
+      email: `${modelName.split('/')[1]}@example.com`, buckets: [],
+    } });
+    await f.click('Refresh quotas');
+    expect(f.document.querySelectorAll('.agy-fleet-card')).toHaveLength(2);
+    expect(card(f.document, 'one@example.com')).toBeTruthy();
+    expect(card(f.document, 'two@example.com')).toBeTruthy();
+    expect(f.invoke).toHaveBeenCalledWith('storage:google-test-account', { modelName: 'models/two', accountId: 'shared' });
+  });
+
+  it('keeps a model enabled through its other account and re-enables an empty disabled pool', async () => {
+    const entry = { ...pool('models/multi', 'first'), googleAccounts: [
+      { id: 'first', email: 'first@example.com', enabled: true, project: 'one' },
+      { id: 'second', email: 'second@example.com', enabled: true, project: 'two' },
+    ] };
+    const f = await fixture(undefined, [entry]);
+    await f.click('Disable account', card(f.document, 'first@example.com'));
+    expect(f.getModels()[0]).toMatchObject({ enabled: true, googleAccounts: [
+      { id: 'first', enabled: false, project: 'one' }, { id: 'second', enabled: true, project: 'two' },
+    ] });
+    await f.click('Disable account', card(f.document, 'second@example.com'));
+    expect(f.getModels()[0].enabled).toBe(false);
+    await f.click('Enable account', card(f.document, 'first@example.com'));
+    expect(f.getModels()[0].enabled).toBe(true);
+    expect((f.getModels()[0].googleAccounts as { enabled: boolean }[])[1].enabled).toBe(false);
+  });
+
+  it('edits all verified account labels without copying credentials, projects, IDs or endpoints', async () => {
+    const entries = ['one', 'two', 'three'].map((name, index) => ({
+      ...pool(`models/${name}`, index === 2 ? 'different-id' : 'shared-id'), googleAccounts: [{
+        id: index === 2 ? 'different-id' : 'shared-id', email: 'shared@example.com', label: name,
+        project: `project-${name}`, cloudCodeEndpoint: `https://${name}.example`, clientId: `client-${name}`,
+        refreshToken: `refresh-${name}`, accessToken: `access-${name}`, enabled: index !== 1,
+      }],
+    }));
+    const f = await fixture(undefined, entries);
+    await f.click('Edit label', card(f.document, 'shared@example.com'));
+    f.input('agy-fleet-account-label', 'New label');
+    await f.click('Save account label', f.document.querySelector('[role="dialog"]')!);
+    expect(f.getModels()).toEqual(entries.map((entry) => ({
+      ...entry, googleAccounts: entry.googleAccounts.map((account) => ({ ...account, label: 'New label' })),
+    })));
+    expect(card(f.document, 'shared@example.com').textContent).toContain('New label');
+  });
+
+  it('detaches the selected account memberships without deleting model definitions or other accounts', async () => {
+    const entries = [
+      { ...pool('models/one', 'first'), googleAccounts: [
+        { id: 'first', email: 'shared@example.com' }, { id: 'same-email-second', email: 'shared@example.com' },
+        { id: 'standby', email: 'standby@example.com' },
+      ] },
+      { ...pool('models/two', 'last'), googleAccounts: [{ id: 'last', email: 'shared@example.com' }] },
+    ];
+    const f = await fixture(undefined, entries);
+    await f.click('Remove from fleet', card(f.document, 'shared@example.com'));
+    expect(f.invoke.mock.calls.filter(([channel]) => channel === 'storage:google-remove-account')).toHaveLength(0);
+    await f.click('Remove from all pools', f.document.querySelector('[role="dialog"]')!);
+    expect(f.getModels()).toHaveLength(2);
+    expect(f.getModels()[0]).toMatchObject({ enabled: true, googleAccounts: [{ id: 'standby', email: 'standby@example.com' }] });
+    expect(f.getModels()[1]).toMatchObject({ enabled: false, googleAccounts: [] });
+    expect(f.invoke.mock.calls.some(([channel]) => channel === 'storage:delete-custom-model')).toBe(false);
+  });
+
+  it('reflects stored preference after A to B to A and clears it explicitly', async () => {
+    const entry = { ...pool('models/preferred "quoted"', 'first'), googlePool: { preferredAccountId: 'first' }, googleAccounts: [
+      { id: 'first', email: 'first@example.com' }, { id: 'second', email: 'second@example.com' },
+    ] };
+    const f = await fixture(undefined, [entry]);
+    await f.click('Use preferred', member(f.document, entry.name, 'second'));
+    await f.click('Use preferred', member(f.document, entry.name, 'first'));
+    expect(member(f.document, entry.name, 'first').querySelector('.agy-pool-badge')!.textContent).toBe('Preferred');
+    expect(member(f.document, entry.name, 'second').querySelector('.agy-pool-badge')!.textContent).toBe('Automatic');
+    expect(f.getModels()[0].googlePool).toMatchObject({ preferredAccountId: 'first' });
+    await f.click('Automatic', member(f.document, entry.name, 'first'));
+    expect(f.invoke).toHaveBeenCalledWith('storage:google-select-account', { modelName: entry.name });
+    expect((f.getModels()[0].googlePool as { preferredAccountId?: string }).preferredAccountId).toBeUndefined();
+    expect(member(f.document, entry.name, 'first').querySelector('.agy-pool-badge')!.textContent).toBe('Automatic');
+  });
+
+  it('restores persisted state after a failed account mutation and keeps the error visible', async () => {
+    const f = await fixture(undefined, [pool('models/failure', 'first')]);
+    f.handlers['storage:save-custom-model'] = () => ({ success: false, error: 'Storage unavailable' });
+    await f.click('Disable account');
+    expect(f.getModels()[0].enabled).toBe(true);
+    expect(card(f.document, 'first@example.com').textContent).toContain('Disable account');
+    expect(f.document.getElementById('agy-google-account-pool-section')!.textContent).toContain('Storage unavailable');
+  });
+
+  it('blocks stale model, group and editor actions until a fleet save and reload finish', async () => {
+    const entry = { ...pool('models/race', 'first'), googleAccounts: [
+      { id: 'first', email: 'first@example.com', enabled: true },
+      { id: 'standby', email: 'standby@example.com', enabled: true },
+    ] };
+    const f = await fixture(undefined, [entry]);
+    const content = f.document.getElementById('agy-custom-models-content')!;
+    const controls = [...content.querySelectorAll<HTMLButtonElement>('button')];
+    const modelDisable = controls.find((button) => button.textContent === 'Disable')!;
+    const groupDisable = controls.find((button) => button.textContent === 'Disable group')!;
+    const edit = controls.find((button) => button.textContent === 'Edit')!;
+    const save = f.handlers['storage:save-custom-model'];
+    let finishSave!: () => void;
+    f.handlers['storage:save-custom-model'] = (record) => {
+      const result = save(record); // The main process has saved, but its reply is still pending.
+      return new Promise((resolve) => { finishSave = () => resolve(result); });
+    };
+    await f.click('Disable account', card(f.document, 'first@example.com'));
+    for (const control of [modelDisable, groupDisable, edit]) {
+      expect(control.disabled).toBe(true);
+      control.click();
+    }
+    expect(f.document.querySelector('[role="dialog"]')).toBeNull();
+    expect(f.invoke.mock.calls.filter(([channel]) => channel === 'storage:save-custom-model')).toHaveLength(1);
+    expect(f.getModels()[0]).toMatchObject({ enabled: true, googleAccounts: [
+      { id: 'first', enabled: false }, { id: 'standby', enabled: true },
+    ] });
+
+    const read = f.handlers['storage:get-custom-models'];
+    let finishReload!: () => void;
+    f.handlers['storage:get-custom-models'] = () => new Promise((resolve) => {
+      finishReload = () => resolve(read());
+    });
+    finishSave();
+    await settle();
+    expect(modelDisable.disabled).toBe(true);
+    modelDisable.click();
+    expect(f.invoke.mock.calls.filter(([channel]) => channel === 'storage:save-custom-model')).toHaveLength(1);
+    f.handlers['storage:save-custom-model'] = save;
+    f.handlers['storage:get-custom-models'] = read;
+    finishReload();
+    await settle();
+
+    // After reload, the model action uses its new record and retains A's disabled state.
+    await f.click('Disable', f.document.getElementById('agy-custom-models-content')!);
+    expect(f.getModels()[0]).toMatchObject({ enabled: false, googleAccounts: [
+      { id: 'first', enabled: false }, { id: 'standby', enabled: true },
+    ] });
+    expect(f.invoke.mock.calls.filter(([channel]) => channel === 'storage:save-custom-model')).toHaveLength(2);
+  });
+
+  it('preserves nested and document scroll throughout a persisted account change', async () => {
+    const f = await fixture('<div id="nested" style="overflow:auto"><section id="settings"><h2>Models &amp; Usage</h2></section></div>',
+      [pool('models/scroll', 'first')]);
+    const nested = f.document.getElementById('nested')!;
+    nested.scrollTop = 520;
+    nested.scrollLeft = 18;
+    f.document.documentElement.scrollTop = 120;
+    for (const id of ['agy-custom-models-content', 'agy-google-account-pool-section']) {
+      const target = f.document.getElementById(id)!;
+      const original = target.replaceChildren.bind(target);
+      vi.spyOn(target, 'replaceChildren').mockImplementation((...nodes) => {
+        original(...nodes);
+        nested.scrollTop = 0;
+        nested.scrollLeft = 0;
+        f.document.documentElement.scrollTop = 0;
+      });
+    }
+    await f.click('Disable account');
+    expect(f.getModels()[0].enabled).toBe(false);
+    expect(nested.scrollTop).toBe(520);
+    expect(nested.scrollLeft).toBe(18);
+    expect(f.document.documentElement.scrollTop).toBe(120);
+  });
+
+  it('persists collapse, preserves target selection and reports an in-flight refresh', async () => {
+    const f = await fixture(undefined, [pool('models/one', 'first'), pool('models/two', 'second')]);
+    const select = f.document.getElementById('agy-fleet-target-pool') as HTMLSelectElement;
+    select.value = 'models/two';
+    select.dispatchEvent(new f.dom.window.Event('change'));
+    f.document.getElementById('agy-fleet-collapse')!.click();
+    expect(f.dom.window.localStorage.getItem('agy_google_fleet_collapsed')).toBe('true');
+    expect(f.document.getElementById('agy-fleet-details')!.hidden).toBe(true);
+    let finish!: (value: unknown) => void;
+    f.handlers['storage:google-test-account'] = () => new Promise((resolve) => { finish = resolve; });
+    await f.click('Refresh quotas');
+    expect((f.document.getElementById('agy-fleet-refresh') as HTMLButtonElement).disabled).toBe(true);
+    expect(f.document.getElementById('agy-google-account-pool-section')!.textContent).toContain('Checking each model pool');
+    f.handlers['storage:google-test-account'] = () => ({ success: true, quota: { buckets: [] } });
+    finish({ success: true, quota: { buckets: [] } });
+    await settle();
+    expect((f.document.getElementById('agy-fleet-target-pool') as HTMLSelectElement).value).toBe('models/two');
+    expect(f.document.getElementById('agy-fleet-details')!.hidden).toBe(true);
+    expect((f.document.getElementById('agy-fleet-refresh') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('toggles native fallback without replacing individual pool strategy or project settings', async () => {
+    const entries = [
+      { ...pool('models/one', 'first'), googlePool: { strategy: 'quota', preferredAccountId: 'first', nativeFailoverEnabled: true } },
+      { ...pool('models/two', 'second'), googlePool: { strategy: 'round-robin', nativeFailoverEnabled: false } },
+    ];
+    const f = await fixture(undefined, entries);
+    const toggle = f.document.getElementById('agy-fleet-native-failover') as HTMLInputElement;
+    expect(toggle.indeterminate).toBe(true);
+    toggle.checked = false;
+    toggle.dispatchEvent(new f.dom.window.Event('change'));
+    await settle();
+    expect(f.getModels()).toEqual(entries.map((entry) => ({ ...entry, googlePool: { ...entry.googlePool, nativeFailoverEnabled: false } })));
+  });
   it('groups a shared email once while preserving every model account, quota and action scope', async () => {
     const first = { ...pool('models/one', 'first-id'), displayName: 'First pool', googleAccounts: [
       { id: 'first-id', email: ' Shared@Example.com ', authMode: 'antigravity', project: 'project-one', cloudCodeEndpoint: 'https://one.example' },
@@ -1213,8 +1463,8 @@ describe('Google fleet and native picker search', () => {
     expect(member(second.name).querySelector('.agy-pool-badge')?.textContent).toBe('Preferred');
     expect(f.invoke).toHaveBeenCalledWith('storage:google-test-account', { modelName: first.name, accountId: 'first-id' });
     expect(f.invoke).toHaveBeenCalledWith('storage:google-test-account', { modelName: second.name, accountId: 'second-id' });
-    await f.click('Use preferred', member(second.name));
-    expect(f.invoke).toHaveBeenCalledWith('storage:google-select-account', { modelName: second.name, accountId: 'second-id' });
+    await f.click('Automatic', member(second.name));
+    expect(f.invoke).toHaveBeenCalledWith('storage:google-select-account', { modelName: second.name });
     await f.click('Reconnect', member(second.name));
     await vi.waitFor(() => expect(f.invoke).toHaveBeenCalledWith('storage:google-link-account', {
       modelName: second.name, accountId: 'pending-account', replaceAccountId: 'second-id',
@@ -1233,11 +1483,11 @@ describe('Google fleet and native picker search', () => {
     expect(f.document.querySelectorAll('.agy-fleet-table tbody > tr')).toHaveLength(2);
   });
 
-  it('uses account IDs for unknown identities and groups verified emails after quota refresh', async () => {
+  it('keeps unknown identities separate until quota verifies a shared email', async () => {
     const f = await fixture(undefined, ['one', 'two', 'three'].map((name) => ({ ...pool(`models/${name}`, 'unused'),
       googleAccounts: [{ id: name === 'three' ? 'third-id' : 'shared-id', label: 'Account', authMode: 'antigravity' }],
     })));
-    expect(f.document.querySelectorAll('.agy-fleet-table tbody > tr')).toHaveLength(2);
+    expect(f.document.querySelectorAll('.agy-fleet-table tbody > tr')).toHaveLength(3);
     f.handlers['storage:google-test-account'] = () => ({ success: true, quota: { email: 'verified@example.com', buckets: [] } });
     await f.click('Refresh quotas');
     expect(f.document.querySelectorAll('.agy-fleet-table tbody > tr')).toHaveLength(1);
@@ -1252,7 +1502,7 @@ describe('Google fleet and native picker search', () => {
       { id: 'standby', accessToken: '********', authMode: 'antigravity' },
     ] };
     const f = await fixture(undefined, [configured]);
-    await f.click('Edit');
+    await f.click('Edit', f.document.getElementById('agy-custom-models-content')!);
     await f.click('Remove account');
     await f.click('Save model');
     const saved = f.getModels()[0];

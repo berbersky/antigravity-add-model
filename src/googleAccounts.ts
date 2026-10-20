@@ -5,6 +5,13 @@ import { createHash, randomInt } from 'crypto';
 import type { GoogleCooldownReason } from './googlePoolPolicy';
 import { describeGoogleAccessError, type GoogleAccessErrorCategory } from './googleAccessErrors';
 import { fetchGoogleUserInfo } from './googleOAuth';
+import {
+  clearOfficialQuota,
+  getOfficialQuota,
+  officialQuotaScopeKey,
+  recordOfficialQuota,
+  type OfficialQuotaScope,
+} from './proxy/shared';
 
 /** A consistent identifier for this application across Cloud Code account and generation requests. */
 export const GOOGLE_CLOUD_CODE_USER_AGENT = 'antigravity-add-model';
@@ -39,6 +46,8 @@ export interface GoogleQuotaBucket {
   groupName?: string;
   remainingFraction?: number;
   resetTime?: string;
+  /** Project measurements and complementary user measurements remain distinguishable. */
+  scope?: 'project' | 'user';
 }
 export interface GoogleQuotaGroup {
   name: string;
@@ -54,6 +63,8 @@ export interface GoogleQuotaSnapshot {
   name?: string;
   buckets: GoogleQuotaBucket[];
   groups?: GoogleQuotaGroup[];
+  project?: string;
+  endpoint?: string;
 }
 interface PoolState {
   id: string;
@@ -61,7 +72,7 @@ interface PoolState {
   inFlight: number;
   lastUsed: number;
   cooldownUntil: number;
-  modelCooldowns: Map<string, { until: number; reason: GoogleCooldownReason }>;
+  modelCooldowns: Map<string, { until: number; reason: GoogleCooldownReason; modelName: string }>;
   requests: number;
   succeeded: number;
   failed: number;
@@ -70,6 +81,7 @@ interface PoolState {
   latency?: { average: number; measuredAt: number };
   authState?: 'unauthorized' | 'forbidden';
   quota?: GoogleQuotaSnapshot;
+  quotas: Map<string, GoogleQuotaSnapshot>;
 }
 export interface GoogleAccountLease {
   account: GoogleAccount;
@@ -131,6 +143,7 @@ function stateFor(account: GoogleAccount): PoolState {
       succeeded: 0,
       failed: 0,
       consecutiveFailures: 0,
+      quotas: new Map(),
     };
     poolStates.set(key, state);
   }
@@ -149,7 +162,7 @@ function quotaIsFresh(quota?: GoogleQuotaSnapshot, now = Date.now()): boolean {
     !quota.buckets.some((bucket) => bucket.resetTime && Date.parse(bucket.resetTime) <= now)
   );
 }
-function quotaFamily(name: string): 'third-party' | 'gemini' | undefined {
+export function quotaFamily(name: string): 'third-party' | 'gemini' | undefined {
   return /claude|gpt|anthropic|openai|third[- ]?party/i.test(name)
     ? 'third-party'
     : /gemini|google/i.test(name)
@@ -168,23 +181,52 @@ function quotaBuckets(quota: GoogleQuotaSnapshot, upstreamModel?: string): Googl
     ? classified.filter((entry) => entry.family === wanted).map((entry) => entry.bucket)
     : quota.buckets;
 }
-function quotaFraction(state: PoolState, upstreamModel?: string, now = Date.now()): number | undefined {
-  if (!quotaIsFresh(state.quota, now) || !state.quota) return undefined;
-  const values = quotaBuckets(state.quota, upstreamModel).flatMap((bucket) =>
+function quotaScope(account: GoogleAccount, endpoint?: string, project = account.project): OfficialQuotaScope {
+  return {
+    accountId: account.id,
+    clientId: account.clientId,
+    project,
+    endpoint: googleAccountEndpoint(account, endpoint),
+  };
+}
+function modelCooldownKey(account: GoogleAccount, model: string, endpoint?: string): string {
+  return `${officialQuotaScopeKey(quotaScope(account, endpoint))}\0${model}`;
+}
+function measuredQuota(state: PoolState, account?: GoogleAccount, endpoint?: string): GoogleQuotaSnapshot | undefined {
+  if (account && !state.quotas.size) return undefined;
+  return account ? state.quotas.get(officialQuotaScopeKey(quotaScope(account, endpoint))) : state.quota;
+}
+function quotaFraction(
+  state: PoolState,
+  upstreamModel?: string,
+  now = Date.now(),
+  account?: GoogleAccount,
+  endpoint?: string,
+): number | undefined {
+  const quota = measuredQuota(state, account, endpoint);
+  if (!quotaIsFresh(quota, now) || !quota) return undefined;
+  const values = quotaBuckets(quota, upstreamModel).flatMap((bucket) =>
     bucket.remainingFraction === undefined ? [] : [bucket.remainingFraction],
   );
   return values.length ? Math.min(...values) : undefined;
 }
-function quotaExhausted(state: PoolState, now = Date.now(), upstreamModel?: string): boolean {
-  if (!quotaIsFresh(state.quota, now) || !state.quota) return false;
-  const buckets = quotaBuckets(state.quota, upstreamModel);
+function quotaExhausted(
+  state: PoolState,
+  now = Date.now(),
+  upstreamModel?: string,
+  account?: GoogleAccount,
+  endpoint?: string,
+): boolean {
+  const quota = measuredQuota(state, account, endpoint);
+  if (!quotaIsFresh(quota, now) || !quota) return false;
+  const buckets = quotaBuckets(quota, upstreamModel);
   return buckets.length > 0 && buckets.every((bucket) => bucket.remainingFraction === 0);
 }
 function measuredLatency(state: PoolState, now = Date.now()): number | undefined {
   return state.latency && now - state.latency.measuredAt < MEASUREMENT_TTL_MS ? state.latency.average : undefined;
 }
-function adaptiveScore(state: PoolState, modelName?: string): number {
-  const quota = quotaFraction(state, modelName);
+function adaptiveScore(state: PoolState, modelName?: string, account?: GoogleAccount, endpoint?: string): number {
+  const quota = quotaFraction(state, modelName, Date.now(), account, endpoint);
   return (
     (quota ?? 0.5) * 100 -
     state.inFlight * 20 -
@@ -192,14 +234,16 @@ function adaptiveScore(state: PoolState, modelName?: string): number {
     Math.min(30, state.consecutiveFailures * 10)
   );
 }
-function selectAdaptive(candidates: GoogleAccount[], modelName?: string): GoogleAccount | undefined {
+function selectAdaptive(candidates: GoogleAccount[], modelName?: string, endpoint?: string): GoogleAccount | undefined {
   if (candidates.length < 2) return candidates[0];
   const first = randomInt(candidates.length);
   let second = randomInt(candidates.length - 1);
   if (second >= first) second++;
   const a = stateFor(candidates[first]),
     b = stateFor(candidates[second]);
-  const difference = adaptiveScore(a, modelName) - adaptiveScore(b, modelName);
+  const difference =
+    adaptiveScore(a, modelName, candidates[first], endpoint) -
+    adaptiveScore(b, modelName, candidates[second], endpoint);
   return difference > 0 || (difference === 0 && a.lastUsed <= b.lastUsed) ? candidates[first] : candidates[second];
 }
 function validAccess(account: GoogleAccount): boolean {
@@ -241,8 +285,13 @@ async function postJson(
   url: URL,
   headers: http.OutgoingHttpHeaders,
   body: string,
+  signal?: AbortSignal,
 ): Promise<{ status: number; data: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new GoogleAccountError('Google account request cancelled.', 499));
+      return;
+    }
     const request = (url.protocol === 'https:' ? https : http).request(
       url,
       { method: 'POST', headers: { ...headers, 'Content-Length': Buffer.byteLength(body) } },
@@ -274,7 +323,12 @@ async function postJson(
       () => request.destroy(new GoogleAccountError('Google account request timed out.', 504)),
       10_000,
     );
-    request.once('close', () => clearTimeout(timeout));
+    const cancel = () => request.destroy(new GoogleAccountError('Google account request cancelled.', 499));
+    signal?.addEventListener('abort', cancel, { once: true });
+    request.once('close', () => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', cancel);
+    });
     request.once('error', (error) =>
       reject(
         error instanceof GoogleAccountError
@@ -366,17 +420,78 @@ export async function fetchGoogleQuota(
   endpoint.pathname = '/v1internal:retrieveUserQuotaSummary';
   endpoint.search = '';
   const current = await refreshGoogleAccount(account);
-  const { status, data } = await postJson(
+  const measuredAt = Date.now();
+  const authHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${current.accessToken}`,
+    'User-Agent': GOOGLE_CLOUD_CODE_USER_AGENT,
+  };
+  let { status, data } = await postJson(
     endpoint,
-    {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${current.accessToken}`,
-      'User-Agent': GOOGLE_CLOUD_CODE_USER_AGENT,
-    },
+    authHeaders,
     JSON.stringify(account.project ? { project: account.project } : {}),
+    options.signal,
   );
   if (status < 200 || status >= 300)
     throw new GoogleAccountError(describeGoogleAccessError(status, 'quota').message, status);
+  const scope = quotaScope(account, endpoint.origin);
+  recordOfficialQuota(data, scope, measuredAt);
+  const observed = getOfficialQuota(scope);
+  // A native observation arriving during this request can be newer than our measurement.
+  if (observed && observed.checkedAt > measuredAt) data = { ...data, ...observed.data };
+  const checkedAt = Math.max(measuredAt, observed?.checkedAt ?? 0);
+  const familyOf = (value: unknown): 'third-party' | 'gemini' | undefined => {
+    if (!value || typeof value !== 'object') return undefined;
+    const item = value as Record<string, unknown>;
+    return quotaFamily(
+      ['name', 'displayName', 'title', 'label', 'id', 'bucketId', 'modelId']
+        .map((field) => (typeof item[field] === 'string' ? item[field] : ''))
+        .join(' '),
+    );
+  };
+  const families = (value: Record<string, unknown>) => [
+    ...(Array.isArray(value.groups)
+      ? value.groups.flatMap((group) => [
+          familyOf(group),
+          ...(group && typeof group === 'object' && Array.isArray(group.buckets) ? group.buckets.map(familyOf) : []),
+        ])
+      : []),
+    ...(Array.isArray(value.buckets) ? value.buckets.map(familyOf) : []),
+  ];
+  const known = families(data);
+  // Some accounts expose third-party quotas per project and Gemini quotas per user.
+  // Only query that complementary scope on the very same validated service origin.
+  if (account.project && known.includes('third-party') && !known.includes('gemini')) {
+    try {
+      const userMeasuredAt = Date.now();
+      const user = await postJson(endpoint, authHeaders, '{}', options.signal);
+      if (user.status >= 200 && user.status < 300) {
+        const userScope = { ...scope, project: undefined };
+        recordOfficialQuota(user.data, userScope, userMeasuredAt);
+        const userObserved = getOfficialQuota(userScope);
+        const userData = userObserved && userObserved.checkedAt > userMeasuredAt ? userObserved.data : user.data;
+        // Unknown or third-party buckets do not prove Gemini availability and are never relabelled.
+        const additionalGroups = (Array.isArray(userData.groups) ? userData.groups : []).flatMap((group) => {
+          if (!group || typeof group !== 'object') return [];
+          const children = Array.isArray(group.buckets) ? group.buckets : [];
+          const selected =
+            familyOf(group) === 'gemini' ? children : children.filter((bucket) => familyOf(bucket) === 'gemini');
+          return selected.length ? [{ ...group, buckets: selected, quotaScope: 'user' }] : [];
+        });
+        const additionalBuckets = (Array.isArray(userData.buckets) ? userData.buckets : [])
+          .filter((bucket) => familyOf(bucket) === 'gemini')
+          .map((bucket) => ({ ...bucket, quotaScope: 'user' }));
+        data = {
+          ...data,
+          groups: [...(Array.isArray(data.groups) ? data.groups : []), ...additionalGroups],
+          buckets: [...(Array.isArray(data.buckets) ? data.buckets : []), ...additionalBuckets],
+        };
+      }
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      // A missing complementary service must not hide the successful project measurement.
+    }
+  }
   const buckets: GoogleQuotaBucket[] = [];
   const groups: GoogleQuotaGroup[] = [];
   const rawGroups = [
@@ -422,7 +537,13 @@ export async function fetchGoogleQuota(
     for (const bucket of Array.isArray(group?.buckets) ? group.buckets : []) {
       if (!bucket || typeof bucket !== 'object') continue;
       const bId =
-        typeof bucket.bucketId === 'string' ? bucket.bucketId : typeof bucket.id === 'string' ? bucket.id : 'quota';
+        typeof bucket.bucketId === 'string'
+          ? bucket.bucketId
+          : typeof bucket.id === 'string'
+            ? bucket.id
+            : typeof bucket.modelId === 'string'
+              ? bucket.modelId
+              : 'quota';
       const bDisplayName =
         typeof bucket.displayName === 'string'
           ? bucket.displayName
@@ -443,6 +564,7 @@ export async function fetchGoogleQuota(
         ...(groupName ? { groupName } : {}),
         remainingFraction: bFraction,
         resetTime: bReset,
+        scope: group.quotaScope === 'user' || bucket.quotaScope === 'user' || !account.project ? 'user' : 'project',
       };
       const explicitId = typeof bucket.bucketId === 'string' ? bucket.bucketId : bucket.id;
       const key = typeof explicitId === 'string' ? explicitId.trim().toLowerCase() : '';
@@ -527,7 +649,9 @@ export async function fetchGoogleQuota(
   }
   const snapshot: GoogleQuotaSnapshot = {
     accountId: account.id,
-    checkedAt: Date.now(),
+    checkedAt,
+    project: account.project,
+    endpoint: endpoint.origin,
     planTier,
     ...(email ? { email } : {}),
     ...(name ? { name } : {}),
@@ -535,8 +659,16 @@ export async function fetchGoogleQuota(
     ...(groups.length > 0 ? { groups } : {}),
     remainingFraction: remaining.length ? Math.min(...remaining) : undefined,
   };
-  stateFor(account).quota = snapshot;
-  return snapshot;
+  const state = stateFor(account);
+  const key = officialQuotaScopeKey(scope);
+  if ((state.quotas.get(key)?.checkedAt ?? -1) <= checkedAt) {
+    state.quotas.delete(key);
+    state.quotas.set(key, snapshot);
+    // Bound route variants independently of the account's shared concurrency counters.
+    while (state.quotas.size > 32) state.quotas.delete(state.quotas.keys().next().value!);
+    state.quota = snapshot;
+  }
+  return state.quotas.get(key) || snapshot;
 }
 
 /** Discover only the models returned for this authenticated account/project. */
@@ -582,6 +714,7 @@ export async function acquireGoogleAccount(
   options: GooglePoolOptions = {},
   requestIdentity?: string,
   cooldownScope = modelName,
+  endpoint?: string,
 ): Promise<GoogleAccountLease> {
   const attempted = new Set<string>();
   const identityKey = requestIdentity
@@ -598,8 +731,8 @@ export async function acquireGoogleAccount(
         !attempted.has(poolKey(account)) &&
         !state.authState &&
         state.cooldownUntil <= now &&
-        (state.modelCooldowns.get(cooldownScope)?.until ?? 0) <= now &&
-        !quotaExhausted(state, now, cooldownScope) &&
+        (state.modelCooldowns.get(modelCooldownKey(account, cooldownScope, endpoint))?.until ?? 0) <= now &&
+        !quotaExhausted(state, now, cooldownScope, account, endpoint) &&
         state.inFlight < (options.maxConcurrency ?? 2)
       );
     });
@@ -608,8 +741,8 @@ export async function acquireGoogleAccount(
         b = stateFor(right);
       if (options.strategy === 'least-loaded' && a.inFlight !== b.inFlight) return a.inFlight - b.inFlight;
       if (options.strategy === 'quota') {
-        const qa = quotaFraction(a, cooldownScope, now) ?? 0.5,
-          qb = quotaFraction(b, cooldownScope, now) ?? 0.5;
+        const qa = quotaFraction(a, cooldownScope, now, left, endpoint) ?? 0.5,
+          qb = quotaFraction(b, cooldownScope, now, right, endpoint) ?? 0.5;
         if (qa !== qb) return qb - qa;
       }
       return a.lastUsed - b.lastUsed;
@@ -623,7 +756,7 @@ export async function acquireGoogleAccount(
     const selected =
       candidates.find((account) => account.id === options.preferredAccountId) ||
       eligibleSticky ||
-      (options.strategy === 'adaptive' ? selectAdaptive(candidates, cooldownScope) : candidates[0]);
+      (options.strategy === 'adaptive' ? selectAdaptive(candidates, cooldownScope, endpoint) : candidates[0]);
     if (!selected)
       throw new GoogleAccountError(
         'No Google account is currently eligible: check authentication, quota, cooldown and concurrency limits.',
@@ -671,7 +804,7 @@ export async function acquireGoogleAccount(
             state.consecutiveFailures++;
           }
           const quotaDenial =
-            result.status === 403 &&
+            (result.status === 400 || result.status === 403) &&
             (result.cooldownReason === 'quota-exhausted' || result.cooldownReason === 'rate-limited');
           if (result.status === 401 || (result.status === 403 && !quotaDenial)) {
             state.authState = result.status === 401 ? 'unauthorized' : 'forbidden';
@@ -695,10 +828,12 @@ export async function acquireGoogleAccount(
                 : (options.cooldownMs ?? 60_000);
             const until = Date.now() + Math.min(delay, 31 * 24 * 60 * 60 * 1000);
             // Concurrent in-flight failures must not shorten a stronger server reset hint.
-            if (until >= (state.modelCooldowns.get(cooldownScope)?.until ?? 0)) {
-              state.modelCooldowns.set(cooldownScope, {
+            const scopedModel = modelCooldownKey(selected, cooldownScope, endpoint);
+            if (until >= (state.modelCooldowns.get(scopedModel)?.until ?? 0)) {
+              state.modelCooldowns.set(scopedModel, {
                 until,
                 reason: result.cooldownReason || (result.status === 429 ? 'rate-limited' : 'upstream-error'),
+                modelName: cooldownScope,
               });
             }
           }
@@ -723,6 +858,7 @@ export function recordGoogleAccountFailure(
   retryAfterMs?: number,
   cooldownScope?: string,
   reason?: GoogleCooldownReason,
+  endpoint?: string,
 ): void {
   const state = stateFor(account);
   state.failed++;
@@ -731,18 +867,19 @@ export function recordGoogleAccountFailure(
   for (const [sKey, entry] of sticky) {
     if (entry.accountId === account.id || entry.accountKey === poolKey(account)) sticky.delete(sKey);
   }
-  const quotaDenial = status === 403 && (reason === 'quota-exhausted' || reason === 'rate-limited');
+  const quotaDenial = (status === 400 || status === 403) && (reason === 'quota-exhausted' || reason === 'rate-limited');
   if (status === 401 || (status === 403 && !quotaDenial)) {
     state.authState = status === 401 ? 'unauthorized' : 'forbidden';
     tokenCache.delete(accountKey(account));
   } else if (quotaDenial || status === 408 || status === 429 || (status && status >= 500)) {
     const delay = Number.isFinite(retryAfterMs) && (retryAfterMs as number) >= 0 ? (retryAfterMs as number) : 60_000;
     const until = Date.now() + Math.min(delay, 31 * 24 * 60 * 60 * 1000);
-    const scope = cooldownScope || 'global';
+    const scope = modelCooldownKey(account, cooldownScope || 'global', endpoint);
     if (until >= (state.modelCooldowns.get(scope)?.until ?? 0)) {
       state.modelCooldowns.set(scope, {
         until,
         reason: reason || (status === 429 ? 'rate-limited' : 'upstream-error'),
+        modelName: cooldownScope || 'global',
       });
     }
   }
@@ -753,7 +890,7 @@ export function getGooglePoolStatus() {
   return [...poolStates.values()].map((state) => {
     const modelCooldowns = [...state.modelCooldowns]
       .filter(([, value]) => value.until > now)
-      .map(([modelName, value]) => ({ modelName, cooldownUntil: value.until, reason: value.reason }));
+      .map(([, value]) => ({ modelName: value.modelName, cooldownUntil: value.until, reason: value.reason }));
     const cooldownUntil = Math.max(state.cooldownUntil, ...modelCooldowns.map((value) => value.cooldownUntil));
     return {
       id: state.id,
@@ -772,7 +909,7 @@ export function getGooglePoolStatus() {
       lastError:
         state.lastStatus >= 400
           ? describeGoogleAccessError(
-              state.lastStatus === 403 &&
+              (state.lastStatus === 400 || state.lastStatus === 403) &&
                 !state.authState &&
                 modelCooldowns.some(
                   (cooldown) => cooldown.reason === 'rate-limited' || cooldown.reason === 'quota-exhausted',
@@ -791,6 +928,7 @@ export function getGooglePoolStatus() {
 
 /** Clear volatile account state after explicit account edits or sign-in. */
 export function resetGoogleAccountState(id?: string): void {
+  clearOfficialQuota(id);
   for (const [key, state] of poolStates) if (!id || state.id === id) poolStates.delete(key);
   for (const [key, account] of tokenCache) if (!id || account.id === id) tokenCache.delete(key);
   if (!id) {

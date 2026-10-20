@@ -320,7 +320,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                     const externalName = model.externalModelName || model.name.replace(/^models\//, '');
                     if (cloudCode) {
                         const identity = originalBody.sessionId || originalBody.conversationId;
-                        accountLease = await (0, googleAccounts_1.acquireGoogleAccount)(model.name, model.googleAccounts || [], model.googlePool, typeof identity === 'string' ? identity : undefined, externalName.replace(/^models\//, ''));
+                        accountLease = await (0, googleAccounts_1.acquireGoogleAccount)(model.name, model.googleAccounts || [], model.googlePool, typeof identity === 'string' ? identity : undefined, externalName.replace(/^models\//, ''), model.apiUrl);
                         if (signal.aborted)
                             break;
                     }

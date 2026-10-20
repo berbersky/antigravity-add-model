@@ -201,7 +201,7 @@ describe('personal Google account onboarding through real local protocol fixture
     });
     expect(discovery.models).toEqual([{ id: 'fixture-gemini', displayName: 'Fixture Gemini' }]);
     const quota = await manager.googleTestAccount({ modelName: 'models/personal-flow', accountId: first.account.id });
-    expect(quota.quota.buckets).toEqual([{ id: 'fixture-quota', remainingFraction: 1, resetTime: undefined }]);
+    expect(quota.quota.buckets).toEqual([{ id: 'fixture-quota', remainingFraction: 1, resetTime: undefined, scope: 'project' }]);
     expect(refreshed).toBe(1);
     const stored = manager.store.read()[0];
     const accounts = (stored.googleAccounts as GoogleAccount[]).map((account) => ({

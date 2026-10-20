@@ -33,6 +33,8 @@ export interface GoogleQuotaBucket {
     groupName?: string;
     remainingFraction?: number;
     resetTime?: string;
+    /** Project measurements and complementary user measurements remain distinguishable. */
+    scope?: 'project' | 'user';
 }
 export interface GoogleQuotaGroup {
     name: string;
@@ -48,6 +50,8 @@ export interface GoogleQuotaSnapshot {
     name?: string;
     buckets: GoogleQuotaBucket[];
     groups?: GoogleQuotaGroup[];
+    project?: string;
+    endpoint?: string;
 }
 export interface GoogleAccountLease {
     account: GoogleAccount;
@@ -66,6 +70,7 @@ export declare class GoogleAccountError extends Error {
 }
 declare let persistAccount: ((modelName: string, account: GoogleAccount, previousAccount: GoogleAccount) => Promise<void> | void) | undefined;
 export declare function configureGoogleAccountPersistence(callback?: typeof persistAccount): void;
+export declare function quotaFamily(name: string): 'third-party' | 'gemini' | undefined;
 /** Preserve local test/custom endpoints, and use the prepared tier for official Google requests. */
 export declare function googleAccountEndpoint(account: GoogleAccount, configured?: string): string;
 /** Refresh requests are coalesced and cached. Endpoint override is restricted to localhost fixtures. */
@@ -81,8 +86,8 @@ export declare function fetchGoogleModels(account: GoogleAccount, baseURL?: stri
     id: string;
     displayName: string;
 }[]>;
-export declare function acquireGoogleAccount(modelName: string, accounts: GoogleAccount[], options?: GooglePoolOptions, requestIdentity?: string, cooldownScope?: string): Promise<GoogleAccountLease>;
-export declare function recordGoogleAccountFailure(account: GoogleAccount, status: number, retryAfterMs?: number, cooldownScope?: string, reason?: GoogleCooldownReason): void;
+export declare function acquireGoogleAccount(modelName: string, accounts: GoogleAccount[], options?: GooglePoolOptions, requestIdentity?: string, cooldownScope?: string, endpoint?: string): Promise<GoogleAccountLease>;
+export declare function recordGoogleAccountFailure(account: GoogleAccount, status: number, retryAfterMs?: number, cooldownScope?: string, reason?: GoogleCooldownReason, endpoint?: string): void;
 export declare function getGooglePoolStatus(): {
     id: string;
     label: string;

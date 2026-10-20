@@ -43,7 +43,7 @@ const storageAPI = { getCustomModels: () => electron_1.ipcRenderer.invoke('model
 window.addEventListener('DOMContentLoaded', () => storageAPI.getCustomModels());
 `;
 
-function fixture(overrides: Record<string, string> = {}, build = customPreload) {
+function fixture(overrides: Record<string, string> = {}, build = customPreload, contextBuild = '// context preload fixture') {
   const files: Record<string, string> = {
     'dist/main.js': vendorMain,
     'dist/languageServer.js': vendorServer,
@@ -52,8 +52,8 @@ function fixture(overrides: Record<string, string> = {}, build = customPreload) 
   };
   const readVendor = vi.fn((name: string) => Buffer.from(files[name]));
   const readBuild = vi.fn((name: string) => {
-    expect(name).toBe('customPreload.js');
-    return Buffer.from(build);
+    expect(['customPreload.js', 'contextUsagePreload.js']).toContain(name);
+    return Buffer.from(name === 'customPreload.js' ? build : contextBuild);
   });
   const plan = () => planRuntimePatch(readVendor, readBuild) as Map<string, Buffer>;
   return { files, readVendor, readBuild, plan };
@@ -217,6 +217,30 @@ describe('vendor runtime adapter', () => {
     expect(invoke).toHaveBeenLastCalledWith('storage:get-items');
     domReady!();
     expect(invoke).toHaveBeenLastCalledWith('models:get-custom-models');
+  });
+
+  it('loads the context preload in its own scope without replacing vendor APIs', () => {
+    const calls: string[] = [];
+    const context = `const electron_1 = require('electron'); electron_1.ipcRenderer.invoke('storage:get-chat-context-usage');`;
+    const source = fixture({}, customPreload, context).plan().get('dist/preload.js')!.toString();
+    const exposed: string[] = [];
+    runInNewContext(source, {
+      require: () => ({
+        ipcRenderer: { invoke: (channel: string) => calls.push(channel) },
+        contextBridge: { exposeInMainWorld: (name: string) => exposed.push(name) },
+      }),
+      window: { addEventListener: () => {} },
+    });
+    expect(calls).toContain('storage:get-chat-context-usage');
+    expect(exposed).toEqual(['nativeStorage', 'wsl', 'futureBridge']);
+  });
+
+  it.each([
+    "require('node:fs');",
+    "require('electron').contextBridge.exposeInMainWorld('nativeStorage', {});",
+    "import('./unvalidated.js');",
+  ])('rejects unsafe context preload additions: %s', (context) => {
+    expect(() => fixture({}, customPreload, context).plan()).toThrow('UNSUPPORTED_RUNTIME');
   });
 
   it.each([

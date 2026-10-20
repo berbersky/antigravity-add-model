@@ -16,6 +16,7 @@ import { CloudCodeRouting } from '../proxy/cloudCodeRouting';
 import * as modelCatalog from '../proxy/modelCatalog';
 import * as modelIdentity from '../modelIdentity';
 import type { ProxyStartOptions } from '../proxy';
+import { clearOfficialQuota, getOfficialQuota, recordOfficialQuota } from '../proxy/shared';
 
 const compiled = ts.transpileModule(fs.readFileSync(path.resolve('src/proxy.ts'), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true },
@@ -25,6 +26,7 @@ const proxies: { stopProxy(): Promise<void> }[] = [];
 const directories: string[] = [];
 
 afterEach(async () => {
+  clearOfficialQuota();
   // Close sockets even when a malformed forwarded response makes the client reject.
   for (const server of servers) server.closeAllConnections();
   for (const proxy of proxies.splice(0)) await proxy.stopProxy();
@@ -47,6 +49,7 @@ async function fixture(
   ideCloudCodeRouting = false,
   lookup?: ConstructorParameters<typeof CloudCodeRouting>[1],
   shutdownGraceMs?: number,
+  models: Record<string, unknown>[] = [],
 ) {
   const directory = fs.mkdtempSync(path.join(tmpdir(), 'agy-forwarding-'));
   directories.push(directory);
@@ -73,7 +76,7 @@ async function fixture(
     zlib,
     electron: { app: { getAppPath: () => path.resolve('scratch/forwarding-fixture') } },
     'electron-log': { info: vi.fn(), error: vi.fn(), warn: vi.fn() },
-    './proxy/shared': { startCleanupInterval: vi.fn(), stopCleanupInterval: vi.fn() },
+    './proxy/shared': { startCleanupInterval: vi.fn(), stopCleanupInterval: vi.fn(), recordOfficialQuota },
     './proxy/modelUtils': {},
     './proxy/modelCatalog': modelCatalog,
     './modelIdentity': modelIdentity,
@@ -89,9 +92,12 @@ async function fixture(
       },
     },
     './proxy/customRequest': { stopCustomRequests: vi.fn() },
-    './modelStore': { readModelConfig: () => [] },
-    './schemaValidator': {},
-    './cryptoStore': { decryptModels: (models: unknown) => models },
+    './modelStore': { readModelConfig: () => models },
+    './schemaValidator': { validateCustomModel: () => ({ valid: true }) },
+    './cryptoStore': {
+      decryptModels: (models: unknown) => JSON.parse(JSON.stringify(models)),
+      decryptString: (value: string) => value,
+    },
     './proxy/loopbackSecurity': loopbackSecurity,
     './proxy/listen': {
       getRequiredProxyPort: () => undefined,
@@ -157,9 +163,47 @@ function post(url: string, body: string, chunked: boolean) {
 }
 
 describe('buffered Google metadata forwarding', () => {
+  it('attributes native quota only to a matching saved credential and its actual request scope', async () => {
+    const quota = { buckets: [{ modelId: 'gemini-pro', remainingFraction: 0.4 }] };
+    const upstream = await serve((_req, res) => res.end(JSON.stringify(quota)));
+    const proxy = await fixture(upstream, false, undefined, undefined, [
+      {
+        name: 'models/quota-fixture',
+        provider: 'google-cloudcode',
+        encryptedGoogleAccounts: true,
+        googleAccounts: [
+          {
+            id: 'matched',
+            clientId: 'desktop',
+            project: 'different-saved-project',
+            accessToken: 'forwarding-fixture-token',
+          },
+          { id: 'unrelated', clientId: 'desktop', project: 'actual-project', accessToken: 'another-token' },
+        ],
+      },
+    ]);
+    const response = await post(
+      `${proxy.url}/v1internal:retrieveUserQuotaSummary`,
+      '{"project":"actual-project"}',
+      false,
+    );
+    expect(response.status).toBe(200);
+    const observedScope = {
+      accountId: 'matched',
+      clientId: 'desktop',
+      project: 'actual-project',
+      endpoint: 'https://daily-cloudcode-pa.googleapis.com',
+    };
+    expect(getOfficialQuota(observedScope)?.data).toEqual(quota);
+    expect(getOfficialQuota({ ...observedScope, accountId: 'unrelated' })).toBeUndefined();
+    expect(getOfficialQuota({ ...observedScope, project: 'different-saved-project' })).toBeUndefined();
+    expect(getOfficialQuota({ ...observedScope, endpoint: 'https://cloudcode-pa.googleapis.com' })).toBeUndefined();
+  });
   it('delivers a catalogue that completes within the shutdown grace period', async () => {
     let received!: () => void;
-    const accepted = new Promise<void>((resolve) => { received = resolve; });
+    const accepted = new Promise<void>((resolve) => {
+      received = resolve;
+    });
     let upstreamResponse!: http.ServerResponse;
     const upstream = await serve((_req, res) => {
       upstreamResponse = res;
@@ -178,38 +222,44 @@ describe('buffered Google metadata forwarding', () => {
     });
   });
 
-  it.each(['/v1internal:loadCodeAssist', '/v1internal:fetchAvailableModels', '/v1beta/models'].flatMap(
-    (route) => [true, false].map((headers) => ({ route, headers })),
-  ))(
-    'releases an unfinished upstream socket during shutdown: $route (headers=$headers)',
-    async ({ route, headers }) => {
-      let received!: () => void;
-      let closed!: () => void;
-      const accepted = new Promise<void>((resolve) => { received = resolve; });
-      const upstreamClosed = new Promise<void>((resolve) => { closed = resolve; });
-      const upstream = await serve((req, res) => {
-        req.socket.once('close', closed);
-        if (headers) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.write('{"pending":');
-        }
-        received();
-      });
-      const proxy = await fixture(upstream, false, undefined, 50);
-      const request = http.request(`${proxy.url}${route}`, { method: route === '/v1beta/models' ? 'GET' : 'POST' });
-      request.on('error', () => {});
-      request.on('response', (response) => { response.on('error', () => {}); response.resume(); });
-      request.end();
-      try {
-        await accepted;
-        await proxy.stop();
-        await upstreamClosed;
-        expect(proxy.forwarded).toHaveLength(1);
-      } finally {
-        request.destroy();
+  it.each(
+    ['/v1internal:loadCodeAssist', '/v1internal:fetchAvailableModels', '/v1beta/models'].flatMap((route) =>
+      [true, false].map((headers) => ({ route, headers })),
+    ),
+  )('releases an unfinished upstream socket during shutdown: $route (headers=$headers)', async ({ route, headers }) => {
+    let received!: () => void;
+    let closed!: () => void;
+    const accepted = new Promise<void>((resolve) => {
+      received = resolve;
+    });
+    const upstreamClosed = new Promise<void>((resolve) => {
+      closed = resolve;
+    });
+    const upstream = await serve((req, res) => {
+      req.socket.once('close', closed);
+      if (headers) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.write('{"pending":');
       }
-    },
-  );
+      received();
+    });
+    const proxy = await fixture(upstream, false, undefined, 50);
+    const request = http.request(`${proxy.url}${route}`, { method: route === '/v1beta/models' ? 'GET' : 'POST' });
+    request.on('error', () => {});
+    request.on('response', (response) => {
+      response.on('error', () => {});
+      response.resume();
+    });
+    request.end();
+    try {
+      await accepted;
+      await proxy.stop();
+      await upstreamClosed;
+      expect(proxy.forwarded).toHaveLength(1);
+    } finally {
+      request.destroy();
+    }
+  });
 
   it('discovers a signed-in caller before forwarding exactly one native generation unchanged', async () => {
     const bodies: string[] = [];

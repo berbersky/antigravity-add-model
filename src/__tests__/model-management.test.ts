@@ -272,7 +272,7 @@ describe('model storage and compatibility', () => {
     });
     const result = await manager.googleTestAccount({ modelName: googleEntry.name, accountId: 'quota-endpoint' });
     expect(requests).toBe(1);
-    expect(result.quota.buckets).toEqual([{ id: 'fixture', remainingFraction: 0.75, resetTime: undefined }]);
+    expect(result.quota.buckets).toEqual([{ id: 'fixture', remainingFraction: 0.75, resetTime: undefined, scope: 'user' }]);
   });
 
   it('does not let a stale refresh overwrite credentials edited while a test was in flight', async () => {

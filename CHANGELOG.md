@@ -2,6 +2,13 @@
 
 Release history preserved from the project README. Historical entries describe the behavior of their release; see [compatibility and recovery](docs/compatibility.md) for current installation guidance.
 
+### Unreleased — Account fleet and visible context estimate
+
+- Add collapsible Google account cards with enable/disable, label editing, removal, per-pool Preferred/Automatic selection and a native fallback switch. Preserve each pool's credentials, project and quotas; serialize mutations to prevent stale saves from overwriting account changes.
+- Display Gemini and Claude quotas with provider-reported plan labels and relative reset times. Scope quota observations by credentials, OAuth client, project and endpoint; handle structured quota failures and bounded retry/reset metadata while retaining exact-model Cloud Code fallback.
+- Add a read-only context ring beside recognized native model selectors. Label visible transcript estimates with `~` and unavailable usage with `?`; preserve configured limits and offer an explicit, bounded public catalog lookup for missing limits. Handle conversation/model switches, compaction, renderer replacement and stale responses without rewriting configuration.
+- Verify real Antigravity 2.23.1 message generation, model switching, compaction, account controls, full restart and conversation continuation with a local deterministic provider. See [test results and boundaries](docs/verification-pr28.md).
+
 ### Unreleased — Compaction resume and account panel fixes
 
 - Address [issue #26](https://github.com/vahapogut/antigravity-add-model/issues/26): remove historical subagent route markers from JSON `initialPrompt` snapshots before scanning active routes. Compacted parent conversations can resume after a proxy restart without binding to a quoted child route; actual expired, ambiguous or parent-replacing routes still fail explicitly.

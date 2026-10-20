@@ -392,7 +392,14 @@ describe('Google account selection and quota', () => {
     });
     const accounts = [account('quota-a'), account('quota-b')];
     await Promise.all(accounts.map((entry) => fetchGoogleQuota(entry, endpoint)));
-    const lease = await acquireGoogleAccount('models/test', accounts, { strategy: 'quota' });
+    const lease = await acquireGoogleAccount(
+      'models/test',
+      accounts,
+      { strategy: 'quota' },
+      undefined,
+      undefined,
+      endpoint,
+    );
     expect(lease.account.id).toBe('quota-b');
     lease.release();
     const empty = await serve((_req, res) => res.end('{}'));
@@ -486,14 +493,16 @@ describe('Google account selection and quota', () => {
     const endpoint = await serve((_req, res) => res.end(JSON.stringify({ buckets })));
     const entry = account('quota-zero');
     await fetchGoogleQuota(entry, endpoint);
-    await expect(acquireGoogleAccount('models/test', [entry])).rejects.toThrow(/quota/);
+    await expect(acquireGoogleAccount('models/test', [entry], {}, undefined, undefined, endpoint)).rejects.toThrow(
+      /quota/,
+    );
     expect(getGooglePoolStatus()[0]).toMatchObject({
       status: 'quota-exhausted',
       quotaFresh: true,
       quotaExhausted: true,
     });
     clock.mockReturnValue(now + 1001);
-    const reset = await acquireGoogleAccount('models/test', [entry]);
+    const reset = await acquireGoogleAccount('models/test', [entry], {}, undefined, undefined, endpoint);
     reset.release();
     expect(getGooglePoolStatus()[0].quotaFresh).toBe(false);
     buckets = [
@@ -501,17 +510,17 @@ describe('Google account selection and quota', () => {
       { bucketId: 'gemini', remainingFraction: 0.8 },
     ];
     await fetchGoogleQuota(entry, endpoint);
-    const mixed = await acquireGoogleAccount('models/test', [entry]);
+    const mixed = await acquireGoogleAccount('models/test', [entry], {}, undefined, undefined, endpoint);
     mixed.release();
     expect(getGooglePoolStatus()[0].quotaExhausted).toBe(false);
     buckets = [{ bucketId: 'claude', remainingFraction: 0 }, { bucketId: 'unknown' }];
     await fetchGoogleQuota(entry, endpoint);
-    const unknown = await acquireGoogleAccount('models/test', [entry]);
+    const unknown = await acquireGoogleAccount('models/test', [entry], {}, undefined, undefined, endpoint);
     unknown.release();
     buckets = [{ bucketId: 'all', remainingFraction: 0 }];
     await fetchGoogleQuota(entry, endpoint);
     clock.mockReturnValue(now + 11 * 60_000);
-    const stale = await acquireGoogleAccount('models/test', [entry]);
+    const stale = await acquireGoogleAccount('models/test', [entry], {}, undefined, undefined, endpoint);
     stale.release();
     expect(getGooglePoolStatus()[0]).toMatchObject({ quotaFresh: false, quotaExhausted: false });
   });
@@ -575,9 +584,18 @@ describe('Google account selection and quota', () => {
       expect.objectContaining({ id: 'gemini-weekly', remainingFraction: 0.8 }),
     ]);
     expect(snapshot.groups?.map((group) => group.name)).toEqual(['Claude and GPT models', 'Models']);
-    const lease = await acquireGoogleAccount('gemini-2.5-pro', [entry], { strategy: 'quota' });
+    const lease = await acquireGoogleAccount(
+      'gemini-2.5-pro',
+      [entry],
+      { strategy: 'quota' },
+      undefined,
+      undefined,
+      endpoint,
+    );
     lease.release();
-    await expect(acquireGoogleAccount('claude-sonnet', [entry])).rejects.toThrow(/quota/);
+    await expect(acquireGoogleAccount('claude-sonnet', [entry], {}, undefined, undefined, endpoint)).rejects.toThrow(
+      /quota/,
+    );
   });
 
   it.each([
@@ -615,8 +633,11 @@ describe('Google account selection and quota', () => {
     expect(snapshot.groups![0].buckets).toEqual(snapshot.buckets);
     expect(snapshot.buckets[0]).toMatchObject({ groupName: 'Gemini Models', remainingFraction: expected, resetTime });
     expect(snapshot.remainingFraction).toBe(expected);
-    if (expected === 0) await expect(acquireGoogleAccount('gemini-2.5-pro', [entry])).rejects.toThrow(/quota/);
-    else (await acquireGoogleAccount('gemini-2.5-pro', [entry])).release();
+    if (expected === 0)
+      await expect(acquireGoogleAccount('gemini-2.5-pro', [entry], {}, undefined, undefined, endpoint)).rejects.toThrow(
+        /quota/,
+      );
+    else (await acquireGoogleAccount('gemini-2.5-pro', [entry], {}, undefined, undefined, endpoint)).release();
   });
 
   it('keeps distinct families that reuse a generic bucket ID', async () => {
@@ -632,8 +653,10 @@ describe('Google account selection and quota', () => {
     const snapshot = await fetchGoogleQuota(entry, endpoint);
     expect(snapshot.buckets).toHaveLength(2);
     expect(snapshot.buckets.map((bucket) => bucket.remainingFraction)).toEqual([0, 0.8]);
-    (await acquireGoogleAccount('gemini-2.5-pro', [entry])).release();
-    await expect(acquireGoogleAccount('claude-sonnet', [entry])).rejects.toThrow(/quota/);
+    (await acquireGoogleAccount('gemini-2.5-pro', [entry], {}, undefined, undefined, endpoint)).release();
+    await expect(acquireGoogleAccount('claude-sonnet', [entry], {}, undefined, undefined, endpoint)).rejects.toThrow(
+      /quota/,
+    );
   });
 
   it('does not assign an unknown flat bucket to a named family or fabricate its quota', async () => {
@@ -648,8 +671,13 @@ describe('Google account selection and quota', () => {
     const entry = account('unknown-flat');
     const snapshot = await fetchGoogleQuota(entry, endpoint);
     expect(snapshot.buckets).toHaveLength(2);
-    expect(snapshot.buckets[1]).toEqual({ id: 'weekly', remainingFraction: undefined, resetTime: undefined });
-    (await acquireGoogleAccount('gemini-2.5-pro', [entry])).release();
+    expect(snapshot.buckets[1]).toEqual({
+      id: 'weekly',
+      remainingFraction: undefined,
+      resetTime: undefined,
+      scope: 'user',
+    });
+    (await acquireGoogleAccount('gemini-2.5-pro', [entry], {}, undefined, undefined, endpoint)).release();
   });
 
   it('keeps different model labels in the same family when they reuse a generic bucket ID', async () => {

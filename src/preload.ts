@@ -261,3 +261,4 @@ declare global {
 
 // Used by the standalone legacy desktop build; installed apps retain their own preload.
 import './customPreload';
+import './contextUsagePreload';

@@ -102,3 +102,112 @@ export function stopCleanupInterval(): void {
 
 // Auto-start for backward compatibility (will be replaced by proxy.ts lifecycle)
 startCleanupInterval();
+
+/** Native quota observations are volatile and isolated to the authenticated request scope. */
+export interface OfficialQuotaScope {
+  accountId: string;
+  clientId?: string;
+  project?: string;
+  endpoint: string;
+}
+interface OfficialQuotaObservation {
+  scope: OfficialQuotaScope;
+  checkedAt: number;
+  data: Record<string, unknown>;
+}
+const officialQuotas = new Map<string, OfficialQuotaObservation>();
+const OFFICIAL_QUOTA_TTL = 10 * 60_000;
+const OFFICIAL_QUOTA_CAPACITY = 128;
+
+export function officialQuotaScopeKey(scope: OfficialQuotaScope): string {
+  const endpoint = new URL(scope.endpoint);
+  const local = ['localhost', '127.0.0.1', '[::1]'].includes(endpoint.hostname);
+  if (
+    !scope.accountId ||
+    [scope.accountId, scope.clientId, scope.project].some(
+      (value) => value !== undefined && (typeof value !== 'string' || value.length > 4096),
+    ) ||
+    endpoint.username ||
+    endpoint.password ||
+    (!local &&
+      (endpoint.protocol !== 'https:' ||
+        !['cloudcode-pa.googleapis.com', 'daily-cloudcode-pa.googleapis.com'].includes(endpoint.hostname))) ||
+    !['http:', 'https:'].includes(endpoint.protocol)
+  )
+    throw new Error('Invalid quota scope');
+  return JSON.stringify([scope.accountId, scope.clientId || '', scope.project || '', endpoint.origin]);
+}
+
+export function recordOfficialQuota(
+  data: Record<string, unknown>,
+  scope: OfficialQuotaScope,
+  checkedAt = Date.now(),
+): void {
+  const now = Date.now();
+  if (
+    !data ||
+    typeof data !== 'object' ||
+    Array.isArray(data) ||
+    !Number.isFinite(checkedAt) ||
+    checkedAt > now ||
+    now - checkedAt >= OFFICIAL_QUOTA_TTL
+  )
+    return;
+  const key = officialQuotaScopeKey(scope);
+  // Keep only fields consumed by the quota parser; never retain an echoed request or credentials.
+  const clean: Record<string, unknown> = {};
+  let remainingBuckets = 256;
+  const bucket = (value: unknown): Record<string, unknown> | undefined => {
+    if (!value || typeof value !== 'object' || remainingBuckets-- <= 0) return undefined;
+    const source = value as Record<string, unknown>;
+    const result: Record<string, unknown> = {};
+    for (const field of ['bucketId', 'id', 'modelId', 'displayName', 'title', 'label', 'resetTime']) {
+      if (typeof source[field] === 'string') result[field] = source[field].slice(0, 512);
+    }
+    if (typeof source.remainingFraction === 'number' && Number.isFinite(source.remainingFraction))
+      result.remainingFraction = Math.max(0, Math.min(1, source.remainingFraction));
+    return result;
+  };
+  if (Array.isArray(data.buckets)) clean.buckets = data.buckets.slice(0, 256).map(bucket).filter(Boolean);
+  if (Array.isArray(data.groups))
+    clean.groups = data.groups.slice(0, 64).flatMap((value) => {
+      if (!value || typeof value !== 'object') return [];
+      const source = value as Record<string, unknown>;
+      const group: Record<string, unknown> = {};
+      for (const field of ['name', 'displayName', 'title', 'label', 'id'])
+        if (typeof source[field] === 'string') group[field] = source[field].slice(0, 512);
+      group.buckets = Array.isArray(source.buckets) ? source.buckets.slice(0, 256).map(bucket).filter(Boolean) : [];
+      return [group];
+    });
+  for (const field of ['subscriptionTier', 'userTier', 'planTier'])
+    if (typeof data[field] === 'string') clean[field] = data[field].slice(0, 128);
+  if (
+    data.paidTier &&
+    typeof data.paidTier === 'object' &&
+    typeof (data.paidTier as Record<string, unknown>).tier === 'string'
+  )
+    clean.paidTier = { tier: ((data.paidTier as Record<string, unknown>).tier as string).slice(0, 128) };
+  if (Buffer.byteLength(JSON.stringify(clean), 'utf8') > 128 * 1024) return;
+  for (const [storedKey, entry] of officialQuotas)
+    if (now < entry.checkedAt || now - entry.checkedAt >= OFFICIAL_QUOTA_TTL) officialQuotas.delete(storedKey);
+  if ((officialQuotas.get(key)?.checkedAt ?? -1) > checkedAt) return;
+  officialQuotas.delete(key);
+  officialQuotas.set(key, { scope: { ...scope }, checkedAt, data: clean });
+  while (officialQuotas.size > OFFICIAL_QUOTA_CAPACITY) officialQuotas.delete(officialQuotas.keys().next().value!);
+}
+
+export function getOfficialQuota(scope: OfficialQuotaScope): OfficialQuotaObservation | undefined {
+  const key = officialQuotaScopeKey(scope);
+  const entry = officialQuotas.get(key);
+  if (!entry) return undefined;
+  if (Date.now() < entry.checkedAt || Date.now() - entry.checkedAt >= OFFICIAL_QUOTA_TTL) {
+    officialQuotas.delete(key);
+    return undefined;
+  }
+  return JSON.parse(JSON.stringify(entry)) as OfficialQuotaObservation;
+}
+
+export function clearOfficialQuota(accountId?: string): void {
+  for (const [key, entry] of officialQuotas)
+    if (!accountId || entry.scope.accountId === accountId) officialQuotas.delete(key);
+}

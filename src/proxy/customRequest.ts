@@ -307,6 +307,7 @@ export async function runCustomModelRequest(
               model.googlePool,
               typeof identity === 'string' ? identity : undefined,
               externalName.replace(/^models\//, ''),
+              model.apiUrl,
             );
             if (signal.aborted) break;
           }

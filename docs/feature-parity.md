@@ -37,6 +37,7 @@ workspace/session/terminal APIs and mobile clients are a separate runtime.
 | Retries, fallback chain, circuit breaker | Available | One request owner applies retry/fallback rules, respects cancellation, and does not retry after output is delivered. Disabled and duplicate fallback entries are skipped. |
 | Streaming/tool compatibility and empty/idle protection | Available | Request-scoped translator state, fragmented SSE handling, empty-stream checks, idle timeout, and tool argument validation. |
 | Health/usage diagnostics | Available across two components | Direct proxy has a Diagnostics dialog with up to 200 measured request records, latency and actual provider token usage; gateway dashboard has persistent history and cost estimates. Missing measurements remain unknown. |
+| Native context estimate ring | Available on recognized chat layouts | Read-only `~` estimate from the identified local transcript; `?` for unavailable usage. Hidden prompts, tool definitions and images are excluded. Configured limits take priority; an explicit click can perform a bounded public models.dev lookup without saving configuration. This is not a measured token percentage. |
 | Modern Settings reinjection | Available | Works with the Models & Usage content container and legacy Models/MCP anchor; handles pane replacement without a URL change. Vendor preload APIs are preserved. |
 | Doctor diagnostics and repair | CLI plus request diagnostics UI | Read-only `npm run doctor`, installer preflight, transactional repair/restore, and a Diagnostics dialog in the existing UI. Installation checks remain CLI; the separate Doctor Electron application is not bundled. |
 | Real model generation test | Available on explicit action | A short, bounded request uses the production translator and reports generated-text success. Separate from the non-generating connection/catalog test; can consume quota. |
@@ -58,7 +59,9 @@ See [customPreload.ts](../src/customPreload.ts),
 | Access-token refresh | Available | Refreshes as needed; concurrent refreshes share the same pending operation; updated credentials can persist encrypted. |
 | Multiple account selection | Available | Round robin, least loaded, quota, or adaptive P2C using measured header latency, load, failures and fresh quota; affinity, concurrency and authentication state remain enforced. |
 | Structured quota/rate-limit governor | Available | Honor Retry-After and typed Google retry/reset metadata; model-specific cooldown and conservative fresh-all-buckets-zero eligibility. No invented five-hour reset or paid-tier quota assumptions. |
-| Quota retrieval / display | Available on request | **Test account** retrieves a quota snapshot, and **Pool status** displays it. The reference's periodic three-minute quota polling is not enabled; quota is refreshed explicitly. |
+| Quota retrieval / display | Available per model pool | Collapsible account cards retain each pool's project, credentials, endpoint and visible quotas. Reset times are relative with an absolute tooltip; plan badges require provider-reported tiers. The mounted panel checks freshness every 30 seconds, reuses results for two minutes, and offers explicit refresh. No account-ID-only quota sharing. |
+| Account card controls | Available | Enable/disable, label-only editing and confirmed removal preserve other accounts and model definitions. Per-pool Reconnect, Remove and Preferred/Automatic controls retain their original scope. |
+| Native request fallback switch | Opt-in | Exact-model Cloud Code pool only, with no ambiguous pool selection or public Gemini API adapter. The fleet switch applies to all Cloud Code pools; per-pool settings remain available. Eligibility, cancellation and retry bounds still apply. |
 | Service/project eligibility | Provider-controlled | OAuth success alone does not grant Cloud Code access or quota. Supply an eligible account/project where required; region and entitlement failures remain visible. |
 
 See [googleOAuth.ts](../src/googleOAuth.ts),
@@ -133,7 +136,7 @@ local OpenAI-compatible provider through the proxy.
 | Full Doctor installation GUI, log viewer and batch generation test | Installation checks remain CLI; our UI provides measured requests and individual generation tests. |
 | Configurable chat prompt pills | Not injected into unknown IDE/workbench chat DOM. Existing drafts and vendor chat controls are left intact. |
 | Separate Gemini CLI identity / AI Studio key pool | Existing Gemini API-key models and explicit Google Cloud Code accounts remain distinct. No bundled OAuth clients or automatic credential extraction. |
-| Automatic quota polling, disk quota/retry history and adaptive retry-budget persistence | Quota refresh is explicit; routing telemetry is process-local. Existing bounded retries and circuit breakers remain available. |
+| Disk quota/retry history and adaptive retry-budget persistence | Fleet quota refresh is bounded and scoped to each pool; routing telemetry is process-local. No global quota file or persistent adaptive retry budget is introduced. Existing bounded retries and circuit breakers remain available. |
 | Lost thought-signature recovery | Existing Google passthrough preserves supplied signatures; no speculative signature cache is added without a reproduced loss case. |
 | Encrypted/password configuration exchange | Reference utility functions have no verified application caller; our export deliberately excludes credentials. |
 
@@ -145,6 +148,10 @@ as approximate. These differences are intentional and are not claims of complete
 product parity.
 
 ## Verification
+
+The [fleet and context indicator verification](verification-pr28.md) records
+the Windows Antigravity 2.23.1 native test, including model switching,
+compaction, full restart, continuation and account controls with local fixtures.
 
 ```sh
 npm run build

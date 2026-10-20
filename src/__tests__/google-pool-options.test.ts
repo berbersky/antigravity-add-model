@@ -38,10 +38,10 @@ describe('explicit Google pool preferences and model quotas', () => {
     });
     const entry = account('alias');
     await fetchGoogleQuota(entry, endpoint);
-    const lease = await acquireGoogleAccount('models/work', [entry], {}, undefined, 'claude-sonnet');
+    const lease = await acquireGoogleAccount('models/work', [entry], {}, undefined, 'claude-sonnet', endpoint);
     lease.release();
     await expect(
-      acquireGoogleAccount('models/claude-looking-alias', [entry], {}, undefined, 'gemini-pro'),
+      acquireGoogleAccount('models/claude-looking-alias', [entry], {}, undefined, 'gemini-pro', endpoint),
     ).rejects.toThrow(/eligible/);
   });
 
@@ -51,7 +51,7 @@ describe('explicit Google pool preferences and model quotas', () => {
     });
     const entry = account('unknown-family');
     await fetchGoogleQuota(entry, endpoint);
-    const lease = await acquireGoogleAccount('models/work', [entry], {}, undefined, 'claude-sonnet');
+    const lease = await acquireGoogleAccount('models/work', [entry], {}, undefined, 'claude-sonnet', endpoint);
     lease.release();
   });
 
@@ -83,14 +83,19 @@ describe('explicit Google pool preferences and model quotas', () => {
     disabled.release();
   });
 
-  it.each(['native', 'lease'])('treats quota 403 as a recoverable model cooldown through %s', async (source) => {
+  it.each([
+    [400, 'native'],
+    [400, 'lease'],
+    [403, 'native'],
+    [403, 'lease'],
+  ] as const)('treats quota %s as a recoverable model cooldown through %s', async (status, source) => {
     const entry = account('recoverable');
     const now = Date.now();
     const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
-    if (source === 'native') recordGoogleAccountFailure(entry, 403, 1000, 'gemini-pro', 'quota-exhausted');
+    if (source === 'native') recordGoogleAccountFailure(entry, status, 1000, 'gemini-pro', 'quota-exhausted');
     else {
       const lease = await acquireGoogleAccount('models/work', [entry], {}, undefined, 'gemini-pro');
-      lease.release({ status: 403, retryAfterMs: 1000, cooldownReason: 'quota-exhausted' });
+      lease.release({ status, retryAfterMs: 1000, cooldownReason: 'quota-exhausted' });
     }
     expect(getGooglePoolStatus()[0]).toMatchObject({ status: 'cooldown', lastError: { category: 'rate-limited' } });
     const other = await acquireGoogleAccount('models/other', [entry], {}, undefined, 'gemini-flash');

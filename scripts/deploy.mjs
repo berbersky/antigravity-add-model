@@ -19,10 +19,12 @@ const PATCHED_URL = Buffer.from('http://localhost:50999/v1internal/xxxxxxx');
 export const REQUIRED_BUILD_FILES = [
   'desktop.js',
   'customPreload.js',
+  'contextUsagePreload.js',
   'customIpc.js',
   'modelStore.js',
   'modelManagement.js',
   'modelActions.js',
+  'chatContext.js',
   'modelIdentity.js',
   'diagnostics.js',
   'generationProbe.js',

@@ -41,7 +41,7 @@ function pool(apiUrl = 'https://daily-cloudcode-pa.googleapis.com'): Pool {
     ],
   };
 }
-async function gateway(models: Pool[], options: Partial<PoolFailoverOptions> = {}) {
+async function gateway(models: Pool[], options: Partial<PoolFailoverOptions> = {}, originalStatus = 429) {
   const completions: Promise<boolean>[] = [];
   const origin = await serve((req, res) => {
     const chunks: Buffer[] = [];
@@ -51,7 +51,7 @@ async function gateway(models: Pool[], options: Partial<PoolFailoverOptions> = {
         req,
         res,
         Buffer.concat(chunks),
-        { statusCode: 429, headers: {} } as http.IncomingMessage,
+        { statusCode: originalStatus, headers: {} } as http.IncomingMessage,
         quotaError,
         {
           loadCustomModels: () => models,
@@ -76,11 +76,11 @@ async function gateway(models: Pool[], options: Partial<PoolFailoverOptions> = {
   });
   return { origin, completions };
 }
-function send(origin: string, model = 'gemini-pro') {
+function send(origin: string, model = 'gemini-pro', path = '/v1internal:streamGenerateContent?alt=sse') {
   let outgoing!: http.ClientRequest;
   const response = new Promise<http.IncomingMessage>((resolve, reject) => {
     outgoing = http.request(
-      `${origin}/v1internal:streamGenerateContent?alt=sse`,
+      `${origin}${path}`,
       {
         method: 'POST',
         headers: { authorization: 'Bearer original', 'x-goog-user-project': 'original-project' },
@@ -108,6 +108,69 @@ describe('native Google account failover', () => {
     expect(resolveGoogleFailoverPool([{ ...configured, enabled: false }], body)).toBeUndefined();
     expect(resolveGoogleFailoverPool([{ ...configured, externalModelName: 'claude-sonnet' }], body)).toBeUndefined();
     expect(resolveGoogleFailoverPool([configured, { ...configured, name: 'models/duplicate' }], body)).toBeUndefined();
+    expect(resolveGoogleFailoverPool([{ ...configured, externalModelName: 'gemini-flash' }], body)).toBeUndefined();
+    expect(
+      resolveGoogleFailoverPool(
+        [{ ...configured, externalModelName: 'gpt-oss' }],
+        Buffer.from('{"model":"claude-sonnet"}'),
+      ),
+    ).toBeUndefined();
+  });
+  it('recognizes only structured quota diagnoses for HTTP 400', () => {
+    expect(isGoogleQuotaFailure(400, quotaError)).toBe(true);
+    expect(isGoogleQuotaFailure(400, '{"error":{"message":"Prompt contains: quota exceeded"}}')).toBe(false);
+    expect(
+      isGoogleQuotaFailure(400, '{"error":{"status":"INVALID_ARGUMENT"},"request":{"prompt":"quota exceeded"}}'),
+    ).toBe(false);
+  });
+
+  it('keeps public Gemini requests closed instead of replaying an incompatible Cloud Code envelope', async () => {
+    const requestFn = vi.fn(() => {
+      throw new Error('Public request must not be replayed');
+    });
+    const fixture = await gateway([pool()], { requestFn: requestFn as unknown as typeof http.request });
+    const response = await send(fixture.origin, 'gemini-pro', '/v1beta/models/gemini-pro:generateContent').response;
+    expect(response.statusCode).toBe(429);
+    await text(response);
+    expect(requestFn).not.toHaveBeenCalled();
+    expect(getGooglePoolStatus()).toEqual([]);
+  });
+
+  it('recovers from quota HTTP 400 and keeps the exhausted standby out of subsequent attempts', async () => {
+    const attempted: string[] = [];
+    const upstream = await serve((req, res) => {
+      attempted.push(req.headers.authorization!);
+      if (req.headers.authorization === 'Bearer token-first') {
+        res.writeHead(400);
+        res.end(
+          JSON.stringify({
+            error: { status: 'RESOURCE_EXHAUSTED', message: 'Individual quota exceeded. Resets in 1h.' },
+          }),
+        );
+      } else res.end('recovered');
+    });
+    const fixture = await gateway([pool(upstream)], {}, 400);
+    expect(await text(await send(fixture.origin).response)).toBe('recovered');
+    expect(await text(await send(fixture.origin).response)).toBe('recovered');
+    expect(attempted).toEqual(['Bearer token-first', 'Bearer token-second', 'Bearer token-second']);
+    expect(getGooglePoolStatus().find((account) => account.id === 'first')).toMatchObject({
+      status: 'cooldown',
+      modelCooldowns: [{ modelName: 'gemini-pro', reason: 'quota-exhausted' }],
+    });
+  });
+
+  it('returns a standby validation error without retrying another account', async () => {
+    let attempts = 0;
+    const upstream = await serve((_req, res) => {
+      attempts++;
+      res.writeHead(400);
+      res.end('{"error":{"status":"INVALID_ARGUMENT","message":"invalid schema"}}');
+    });
+    const fixture = await gateway([pool(upstream)]);
+    const response = await send(fixture.origin).response;
+    expect(response.statusCode).toBe(400);
+    expect(await text(response)).toContain('INVALID_ARGUMENT');
+    expect(attempts).toBe(1);
   });
 
   it('distinguishes explicit quota 403 from permission errors mentioning quota', () => {
