@@ -166,9 +166,14 @@ function post(url: string, body: string, chunked: boolean) {
 }
 
 describe('OpenAI tool reasoning through the desktop HTTP proxy', () => {
-  it.each([false, true])(
-    'replays reasoning with a tool result without exposing it as content (stream=%s)',
-    async (stream) => {
+  it.each([
+    { stream: false, omitThought: false },
+    { stream: true, omitThought: false },
+    { stream: false, omitThought: true },
+    { stream: true, omitThought: true },
+  ])(
+    'replays reasoning with a tool result without exposing it as content (stream=$stream, IDE omits thought=$omitThought)',
+    async ({ stream, omitThought }) => {
       const reasoning = 'Inspect the fixture before answering. Keep this analysis with the tool call.';
       const visible = 'I will read the fixture.';
       const toolCall = {
@@ -240,7 +245,8 @@ describe('OpenAI tool reasoning through the desktop HTTP proxy', () => {
           ],
         },
       ];
-      const first = await post(endpoint, JSON.stringify({ contents: [user], tools }), false);
+      const labels = { cascade_id: 'reasoning-replay-fixture-cascade' };
+      const first = await post(endpoint, JSON.stringify({ contents: [user], tools, labels }), false);
       expect(first.status).toBe(200);
       type Part = { text?: string; thought?: boolean; functionCall?: { id: string; name: string; args: unknown } };
       type Reply = { candidates: { content: { parts: Part[] } }[] };
@@ -279,7 +285,7 @@ describe('OpenAI tool reasoning through the desktop HTTP proxy', () => {
         JSON.stringify({
           contents: [
             user,
-            { role: 'model', parts },
+            { role: 'model', parts: omitThought ? parts.filter((part) => !part.thought) : parts },
             {
               role: 'user',
               parts: [
@@ -294,6 +300,7 @@ describe('OpenAI tool reasoning through the desktop HTTP proxy', () => {
             },
           ],
           tools,
+          labels,
         }),
         true,
       );
@@ -309,6 +316,207 @@ describe('OpenAI tool reasoning through the desktop HTTP proxy', () => {
       ]);
     },
   );
+});
+
+describe('IDE history that omits tool reasoning', () => {
+  type Part = { text?: string; thought?: boolean; functionCall?: { id: string; name: string; args: unknown } };
+  type Content = { role: string; parts: Record<string, unknown>[] };
+  type Call = { id: string; type: 'function'; function: { name: string; arguments: string } };
+  type Turn = { reasoning: string; calls: Call[] };
+  const identity = { labels: { cascade_id: 'omitted-reasoning-cascade' } };
+  const call = (id: string, file: string): Call => ({
+    id,
+    type: 'function',
+    function: { name: 'fixture_read', arguments: JSON.stringify({ path: file }) },
+  });
+
+  async function replayFixture(stream: boolean, turns: Turn[], outcome: 'success' | 'truncated' | 'error' = 'success') {
+    const received: { model: string; messages: Record<string, unknown>[] }[] = [];
+    const upstream = await serve((req, res) => {
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer) => chunks.push(chunk));
+      req.on('end', () => {
+        const turn = turns[received.length];
+        received.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        if (stream) {
+          res.setHeader('Content-Type', 'text/event-stream');
+          const choices = turn
+            ? [
+                { delta: { reasoning_content: turn.reasoning } },
+                {
+                  delta: { tool_calls: turn.calls.map((tool, index) => ({ index, ...tool })) },
+                  ...(outcome === 'truncated' ? {} : { finish_reason: 'tool_calls' }),
+                },
+              ]
+            : [{ delta: { content: 'Finished.' }, finish_reason: 'stop' }];
+          for (const choice of choices) res.write(`data: ${JSON.stringify({ choices: [choice] })}\n\n`);
+          if (turn && outcome === 'error')
+            res.end(`data: ${JSON.stringify({ error: { message: 'Fixture failure.' } })}\n\n`);
+          else res.end(turn && outcome === 'truncated' ? '' : 'data: [DONE]\n\n');
+        } else {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(
+            JSON.stringify({
+              choices: [
+                {
+                  message: turn
+                    ? { content: '', reasoning_content: turn.reasoning, tool_calls: turn.calls }
+                    : { content: 'Finished.' },
+                  finish_reason: turn ? 'tool_calls' : 'stop',
+                },
+              ],
+            }),
+          );
+        }
+      });
+    });
+    const model = {
+      name: 'models/omitted-reasoning-fixture',
+      displayName: 'Omitted reasoning fixture',
+      provider: 'openai',
+      apiKey: 'omitted-reasoning-local-key',
+      encrypted: true,
+      apiUrl: upstream,
+      externalModelName: 'omitted-reasoning-model',
+      maxRetries: 0,
+    };
+    const proxy = await fixture(upstream, false, undefined, undefined, [model]);
+    return {
+      model,
+      received,
+      async send(contents: Content[], scope: Record<string, unknown>, expectStreamError = false) {
+        const endpoint = `${proxy.url}/v1beta/${model.name}:${stream ? 'streamGenerateContent' : 'generateContent'}`;
+        const response = await post(endpoint, JSON.stringify({ contents, ...scope }), false);
+        expect(response.status).toBe(200);
+        const replies: { candidates?: { content: { parts: Part[] } }[]; error?: unknown }[] = stream
+          ? response.body
+              .toString('utf8')
+              .split('\n')
+              .filter((line) => line.startsWith('data: '))
+              .map((line) => JSON.parse(line.slice(6)))
+          : [JSON.parse(response.body.toString('utf8'))];
+        expect(replies.some((reply) => reply.error)).toBe(expectStreamError);
+        return replies.flatMap((reply) => reply.candidates?.flatMap((candidate) => candidate.content.parts) || []);
+      },
+    };
+  }
+
+  function appendToolTurn(history: Content[], parts: Part[]): Content[] {
+    return [
+      ...history,
+      { role: 'model', parts: parts.filter((part) => !part.thought) },
+      {
+        role: 'user',
+        parts: parts
+          .filter((part) => part.functionCall)
+          .map((part) => ({
+            functionResponse: {
+              id: part.functionCall!.id,
+              name: part.functionCall!.name,
+              response: { content: `Result for ${part.functionCall!.id}` },
+            },
+          })),
+      },
+    ];
+  }
+
+  it.each([false, true])(
+    'restores each sequential turn and its parallel calls independently (stream=%s)',
+    async (stream) => {
+      const turns: Turn[] = [
+        {
+          reasoning: 'Read the two fixtures together.',
+          calls: [call('parallel-a', '/a.txt'), call('parallel-b', '/b.txt')],
+        },
+        { reasoning: 'Compare those results with the third fixture.', calls: [call('sequential-c', '/c.txt')] },
+      ];
+      const fixture = await replayFixture(stream, turns);
+      let history: Content[] = [{ role: 'user', parts: [{ text: 'Compare the three fixtures.' }] }];
+      for (const turn of turns) {
+        const parts = await fixture.send(history, identity);
+        expect(
+          parts
+            .filter((part) => part.thought)
+            .map((part) => part.text)
+            .join(''),
+        ).toBe(turn.reasoning);
+        history = appendToolTurn(history, parts);
+      }
+      await fixture.send(history, identity);
+      expect(fixture.received).toHaveLength(3);
+      expect(fixture.received[2].messages.filter((message) => message.role === 'assistant')).toEqual(
+        turns.map((turn) => ({
+          role: 'assistant',
+          content: null,
+          reasoning_content: turn.reasoning,
+          tool_calls: turn.calls,
+        })),
+      );
+      expect(
+        fixture.received[2].messages
+          .filter((message) => message.role === 'tool')
+          .map((message) => message.tool_call_id),
+      ).toEqual(['parallel-a', 'parallel-b', 'sequential-c']);
+      expect(history.flatMap((content) => content.parts).some((part) => part.thought)).toBe(false);
+    },
+  );
+
+  it.each(['conversation', 'missing identity', 'configured model', 'external model', 'endpoint', 'credential'])(
+    'does not replay cached reasoning after changing %s',
+    async (changedScope) => {
+      const turn = {
+        reasoning: 'This reasoning belongs only to the original request scope.',
+        calls: [call('scoped-call', '/a.txt')],
+      };
+      const fixture = await replayFixture(true, [turn]);
+      const initial: Content[] = [{ role: 'user', parts: [{ text: 'Read the fixture.' }] }];
+      const history = appendToolTurn(initial, await fixture.send(initial, identity));
+      let scope: Record<string, unknown> = identity;
+      if (changedScope === 'conversation') scope = { labels: { cascade_id: 'other-reasoning-cascade' } };
+      if (changedScope === 'missing identity') scope = {};
+      if (changedScope === 'configured model') fixture.model.name = 'models/other-reasoning-fixture';
+      if (changedScope === 'external model') fixture.model.externalModelName = 'other-reasoning-model';
+      if (changedScope === 'endpoint') fixture.model.apiUrl += '/other-provider';
+      if (changedScope === 'credential') fixture.model.apiKey = 'different-local-fixture-key';
+      await fixture.send(history, scope);
+      expect(fixture.received).toHaveLength(2);
+      const assistant = fixture.received[1].messages.find((message) => message.role === 'assistant')!;
+      expect(assistant.reasoning_content || '').toBe('');
+      expect(assistant.tool_calls).toEqual(turn.calls);
+    },
+  );
+
+  it.each(['truncated', 'error'] as const)('does not cache reasoning from a %s stream', async (outcome) => {
+    const turn = {
+      reasoning: 'Reasoning from an unsuccessful fixture response.',
+      calls: [call('failed-call', '/a.txt')],
+    };
+    const fixture = await replayFixture(true, [turn], outcome);
+    const initial: Content[] = [{ role: 'user', parts: [{ text: 'Read the fixture.' }] }];
+    await fixture.send(initial, identity, true);
+    const history = appendToolTurn(
+      initial,
+      turn.calls.map((tool) => ({
+        functionCall: { id: tool.id, name: tool.function.name, args: JSON.parse(tool.function.arguments) },
+      })),
+    );
+    await fixture.send(history, identity);
+    const assistant = fixture.received[1].messages.find((message) => message.role === 'assistant')!;
+    expect(assistant.reasoning_content || '').toBe('');
+    expect(assistant.tool_calls).toEqual(turn.calls);
+  });
+
+  it('clears retained reasoning when custom requests stop', async () => {
+    const turn = { reasoning: 'Reasoning retained until the proxy stops.', calls: [call('stop-call', '/a.txt')] };
+    const fixture = await replayFixture(true, [turn]);
+    const initial: Content[] = [{ role: 'user', parts: [{ text: 'Read the fixture.' }] }];
+    const history = appendToolTurn(initial, await fixture.send(initial, identity));
+    customRequest.stopCustomRequests();
+    await fixture.send(history, identity);
+    const assistant = fixture.received[1].messages.find((message) => message.role === 'assistant')!;
+    expect(assistant.reasoning_content || '').toBe('');
+    expect(assistant.tool_calls).toEqual(turn.calls);
+  });
 });
 
 describe('buffered Google metadata forwarding', () => {

@@ -28,6 +28,7 @@ import { collectToolSchemas } from './translators/utils';
 import { subagentRouting, SubagentRoutingError } from './subagentRouting';
 import { resolveConfiguredSubagentModel } from './subagentModels';
 import { isGoogleQuotaFailure } from './googlePoolFailover';
+import { reasoningReplayCache } from './reasoningReplay';
 
 const circuits = new CircuitBreaker();
 const controllers = new Set<AbortController>();
@@ -48,6 +49,7 @@ export function getProxyMetrics() {
 }
 export function stopCustomRequests(): void {
   for (const controller of controllers) controller.abort();
+  reasoningReplayCache.clear();
 }
 
 class UpstreamError extends Error {
@@ -286,6 +288,22 @@ export async function runCustomModelRequest(
       const attemptsAllowed = retries + Math.max(0, accountCount - 1);
       for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
         const stateKey = randomUUID();
+        let replayReasoning = '';
+        const replayCalls: unknown[] = [];
+        let replayOverflow = false;
+        const observeCandidate = (candidate: unknown) => {
+          const parts = (candidate as { content?: { parts?: Record<string, unknown>[] } })?.content?.parts;
+          for (const part of parts || []) {
+            if (replayOverflow) break;
+            if (part.thought === true && typeof part.text === 'string') replayReasoning += part.text;
+            if (part.functionCall) replayCalls.push(part);
+            if (replayReasoning.length > 256 * 1024 || replayCalls.length > 128) {
+              replayOverflow = true;
+              replayReasoning = '';
+              replayCalls.length = 0;
+            }
+          }
+        };
         let request: http.ClientRequest | undefined;
         let accountLease: GoogleAccountLease | undefined;
         let totalTimer: ReturnType<typeof setTimeout> | undefined;
@@ -321,7 +339,10 @@ export async function runCustomModelRequest(
                 originalBody.generationConfig?.maxOutputTokens ||
                   (model.contextWindow ? Math.min(4000, Math.max(1, Math.floor(model.contextWindow / 4))) : 0),
               );
-            const body = trimContext(originalBody, model.contextWindow, outputBudget);
+            // The IDE can omit thought parts when replaying completed tool calls.
+            // Recover only this conversation/provider's matching turn before budgeting.
+            const history = format === 'openai' ? reasoningReplayCache.restore(originalBody, model) : originalBody;
+            const body = trimContext(history, model.contextWindow, outputBudget);
             const effectiveModel = outputBudget ? { ...model, maxOutputTokens: outputBudget } : model;
             payload = applyRequestOptions(
               registry.translateRequest(model.provider, body, externalName, format, stateKey) as Record<
@@ -512,6 +533,7 @@ export async function runCustomModelRequest(
                 finishReason?: string;
               } | null;
               if (mapped) {
+                if (format === 'openai') observeCandidate(mapped);
                 if (mapped.content?.parts?.length) emitted = true;
                 if (mapped.finishReason && mapped.finishReason !== 'OTHER') finalReason = true;
                 // A role-only or empty completion must not commit headers and prevent fallback.
@@ -573,6 +595,7 @@ export async function runCustomModelRequest(
               candidates?: unknown[];
             };
             if (!mapped?.candidates?.length) throw new UpstreamError('Upstream returned no candidates.');
+            if (format === 'openai') for (const candidate of mapped.candidates) observeCandidate(candidate);
             if (
               kind === 'generation-test' &&
               !mapped.candidates.some((candidate) => {
@@ -606,6 +629,13 @@ export async function runCustomModelRequest(
               res.end(JSON.stringify(envelope(routed, cloudEnvelope)));
             }
           }
+          // Do not retain partial, failed, cancelled, or retried output. This cache
+          // outlives the per-attempt translator state, but never the proxy service.
+          if (format === 'openai' && !replayOverflow && !signal.aborted)
+            reasoningReplayCache.record(originalBody, model, [
+              { text: replayReasoning, thought: true },
+              ...replayCalls,
+            ]);
           circuits.succeed(circuitKey);
           completed = true;
           accountLease?.release({ status, latencyMs: headerLatencyMs });

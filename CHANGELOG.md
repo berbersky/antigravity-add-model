@@ -6,6 +6,8 @@ Release history preserved from the project README. Historical entries describe t
 
 - Address the reasoning loss reported in [PR #29](https://github.com/vahapogut/antigravity-add-model/pull/29): use one assistant-message mapping for normal and tool-call history so each turn retains its own `reasoning_content`, separate from visible text. Preserve tool identifiers, arguments, results and message order.
 - Preserve provider reasoning in nonstreaming tool-call responses, including recognized DSML calls, so subsequent requests can replay it. Add regression coverage for sequential and parallel calls, response round trips and local HTTP continuations. Provider-specific use of reasoning remains outside this protocol-level guarantee.
+- Recover completed tool-turn reasoning when the native IDE omits thought parts from history. Keep recovery bounded and in memory, scoped to the conversation, configured provider and exact tool-call group; reject missing identity, changed calls, ambiguous reused IDs and failed responses. Clear recovery state on service shutdown.
+- Verify two real native file reads and successful continuation in Antigravity IDE 2.5.5 with OpenRouter's Nemotron 3.5 Lightning (free). All three response-to-history reasoning fingerprints matched; see [live test results and boundaries](docs/verification-pr29.md).
 
 ### Unreleased — Account fleet and visible context estimate
 

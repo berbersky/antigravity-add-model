@@ -54,6 +54,7 @@ const utils_1 = require("./translators/utils");
 const subagentRouting_1 = require("./subagentRouting");
 const subagentModels_1 = require("./subagentModels");
 const googlePoolFailover_1 = require("./googlePoolFailover");
+const reasoningReplay_1 = require("./reasoningReplay");
 const circuits = new circuitBreaker_1.CircuitBreaker();
 const controllers = new Set();
 const counts = {
@@ -74,6 +75,7 @@ function getProxyMetrics() {
 function stopCustomRequests() {
     for (const controller of controllers)
         controller.abort();
+    reasoningReplay_1.reasoningReplayCache.clear();
 }
 class UpstreamError extends Error {
     constructor(message, status = 502, retryable = true, retryAfter = 0, mayFallback = true, googleRateLimit) {
@@ -303,6 +305,25 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
             const attemptsAllowed = retries + Math.max(0, accountCount - 1);
             for (let attempt = 0; attempt <= attemptsAllowed; attempt++) {
                 const stateKey = (0, crypto_1.randomUUID)();
+                let replayReasoning = '';
+                const replayCalls = [];
+                let replayOverflow = false;
+                const observeCandidate = (candidate) => {
+                    const parts = candidate?.content?.parts;
+                    for (const part of parts || []) {
+                        if (replayOverflow)
+                            break;
+                        if (part.thought === true && typeof part.text === 'string')
+                            replayReasoning += part.text;
+                        if (part.functionCall)
+                            replayCalls.push(part);
+                        if (replayReasoning.length > 256 * 1024 || replayCalls.length > 128) {
+                            replayOverflow = true;
+                            replayReasoning = '';
+                            replayCalls.length = 0;
+                        }
+                    }
+                };
                 let request;
                 let accountLease;
                 let totalTimer;
@@ -331,7 +352,10 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                         const outputBudget = model.maxOutputTokens ??
                             Number(originalBody.generationConfig?.maxOutputTokens ||
                                 (model.contextWindow ? Math.min(4000, Math.max(1, Math.floor(model.contextWindow / 4))) : 0));
-                        const body = (0, requestOptions_1.trimContext)(originalBody, model.contextWindow, outputBudget);
+                        // The IDE can omit thought parts when replaying completed tool calls.
+                        // Recover only this conversation/provider's matching turn before budgeting.
+                        const history = format === 'openai' ? reasoningReplay_1.reasoningReplayCache.restore(originalBody, model) : originalBody;
+                        const body = (0, requestOptions_1.trimContext)(history, model.contextWindow, outputBudget);
                         const effectiveModel = outputBudget ? { ...model, maxOutputTokens: outputBudget } : model;
                         payload = (0, requestOptions_1.applyRequestOptions)(registry.translateRequest(model.provider, body, externalName, format, stateKey), effectiveModel, format, isStream, compactionEffort);
                         const target = cloudCode || model.rawUrl
@@ -479,6 +503,8 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                             }
                             const mapped = registry.translateStreamChunk(model.provider, chunk, stateKey, format, stateKey, toolSchemas);
                             if (mapped) {
+                                if (format === 'openai')
+                                    observeCandidate(mapped);
                                 if (mapped.content?.parts?.length)
                                     emitted = true;
                                 if (mapped.finishReason && mapped.finishReason !== 'OTHER')
@@ -553,6 +579,9 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                         const mapped = registry.translateResponse(model.provider, parsed, stateKey, format, toolSchemas);
                         if (!mapped?.candidates?.length)
                             throw new UpstreamError('Upstream returned no candidates.');
+                        if (format === 'openai')
+                            for (const candidate of mapped.candidates)
+                                observeCandidate(candidate);
                         if (kind === 'generation-test' &&
                             !mapped.candidates.some((candidate) => {
                                 const content = candidate
@@ -576,6 +605,13 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                             res.end(JSON.stringify(envelope(routed, cloudEnvelope)));
                         }
                     }
+                    // Do not retain partial, failed, cancelled, or retried output. This cache
+                    // outlives the per-attempt translator state, but never the proxy service.
+                    if (format === 'openai' && !replayOverflow && !signal.aborted)
+                        reasoningReplay_1.reasoningReplayCache.record(originalBody, model, [
+                            { text: replayReasoning, thought: true },
+                            ...replayCalls,
+                        ]);
                     circuits.succeed(circuitKey);
                     completed = true;
                     accountLease?.release({ status, latencyMs: headerLatencyMs });
