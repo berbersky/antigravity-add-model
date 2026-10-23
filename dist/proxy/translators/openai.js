@@ -65,6 +65,18 @@ function compactContent(parts) {
         ? parts
         : parts.map((part) => (part.type === 'text' ? part.text : '')).join('\n');
 }
+function mapAssistantMessage(parts) {
+    let content = '';
+    let reasoning = '';
+    for (const part of parts) {
+        if (part.thought)
+            reasoning += part.text || '';
+        else
+            content += part.text || '';
+    }
+    // Replay reasoning from this history item for both ordinary and tool-call turns.
+    return { role: 'assistant', content, ...(reasoning ? { reasoning_content: reasoning } : {}) };
+}
 function mapGeminiToolsToOpenAI(geminiTools) {
     if (!geminiTools || !Array.isArray(geminiTools))
         return [];
@@ -137,11 +149,10 @@ function mapGeminiToOpenAI(geminiBody, modelName, stateKey = modelName) {
                             });
                         }
                     }
-                    const text = item.parts
-                        .filter((p) => p.text && !p.thought)
-                        .map((p) => p.text)
-                        .join('');
-                    messages.push({ role: 'assistant', content: text || null, tool_calls: toolCalls });
+                    const message = mapAssistantMessage(item.parts);
+                    message.content = message.content || null;
+                    message.tool_calls = toolCalls;
+                    messages.push(message);
                 }
                 else if (hasFunctionResponse) {
                     for (const p of item.parts) {
@@ -172,21 +183,12 @@ function mapGeminiToOpenAI(geminiBody, modelName, stateKey = modelName) {
                 }
                 else {
                     const role = item.role === 'model' ? 'assistant' : item.role || 'user';
-                    let content = '';
-                    let reasoning_content = '';
                     if (role === 'assistant') {
-                        const regularParts = (item.parts || []).filter((p) => !p.thought);
-                        const thoughtParts = (item.parts || []).filter((p) => p.thought);
-                        content = regularParts.map((p) => p.text || '').join('');
-                        reasoning_content = thoughtParts.map((p) => p.text || '').join('');
+                        messages.push(mapAssistantMessage(item.parts));
                     }
                     else {
-                        content = compactContent(mapUserContentParts(item.parts));
+                        messages.push({ role, content: compactContent(mapUserContentParts(item.parts)) });
                     }
-                    const msg = { role, content };
-                    if (reasoning_content)
-                        msg.reasoning_content = reasoning_content;
-                    messages.push(msg);
                 }
             }
         }
@@ -276,6 +278,7 @@ function parseDSMLToolCalls(text) {
 }
 function mapOpenAIToGemini(openAiRes, modelName, toolSchemas) {
     const choice = openAiRes.choices?.[0];
+    const reasoning = choice?.message?.reasoning_content || choice?.message?.reasoning || '';
     if (choice?.message?.tool_calls && choice.message.tool_calls.length > 0) {
         const parts = choice.message.tool_calls.map((tc) => {
             let args;
@@ -309,6 +312,8 @@ function mapOpenAIToGemini(openAiRes, modelName, toolSchemas) {
         });
         if (choice.message.content)
             parts.unshift({ text: choice.message.content });
+        if (reasoning)
+            parts.unshift({ text: reasoning, thought: true });
         return {
             candidates: [{ content: { parts, role: 'model' }, finishReason: 'STOP', index: 0 }],
             usageMetadata: {
@@ -328,6 +333,8 @@ function mapOpenAIToGemini(openAiRes, modelName, toolSchemas) {
         });
         if (dsml.cleanText)
             parts.unshift({ text: dsml.cleanText });
+        if (reasoning)
+            parts.unshift({ text: reasoning, thought: true });
         return {
             candidates: [{ content: { parts, role: 'model' }, finishReason: 'STOP', index: 0 }],
             usageMetadata: {
@@ -337,7 +344,6 @@ function mapOpenAIToGemini(openAiRes, modelName, toolSchemas) {
             },
         };
     }
-    const reasoning = choice?.message?.reasoning_content || choice?.message?.reasoning || '';
     const parts = [];
     if (reasoning)
         parts.push({ text: reasoning, thought: true });

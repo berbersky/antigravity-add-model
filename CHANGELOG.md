@@ -2,6 +2,11 @@
 
 Release history preserved from the project README. Historical entries describe the behavior of their release; see [compatibility and recovery](docs/compatibility.md) for current installation guidance.
 
+### Unreleased — Preserve reasoning across tool calls
+
+- Address the reasoning loss reported in [PR #29](https://github.com/vahapogut/antigravity-add-model/pull/29): use one assistant-message mapping for normal and tool-call history so each turn retains its own `reasoning_content`, separate from visible text. Preserve tool identifiers, arguments, results and message order.
+- Preserve provider reasoning in nonstreaming tool-call responses, including recognized DSML calls, so subsequent requests can replay it. Add regression coverage for sequential and parallel calls, response round trips and local HTTP continuations. Provider-specific use of reasoning remains outside this protocol-level guarantee.
+
 ### Unreleased — Account fleet and visible context estimate
 
 - Add collapsible Google account cards with enable/disable, label editing, removal, per-pool Preferred/Automatic selection and a native fallback switch. Preserve each pool's credentials, project and quotas; serialize mutations to prevent stale saves from overwriting account changes.

@@ -15,8 +15,11 @@ import { listenProxy } from '../proxy/listen';
 import { CloudCodeRouting } from '../proxy/cloudCodeRouting';
 import * as modelCatalog from '../proxy/modelCatalog';
 import * as modelIdentity from '../modelIdentity';
+import * as customRequest from '../proxy/customRequest';
 import type { ProxyStartOptions } from '../proxy';
 import { clearOfficialQuota, getOfficialQuota, recordOfficialQuota } from '../proxy/shared';
+
+vi.mock('electron-log', () => ({ default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 
 const compiled = ts.transpileModule(fs.readFileSync(path.resolve('src/proxy.ts'), 'utf8'), {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020, esModuleInterop: true },
@@ -91,7 +94,7 @@ async function fixture(
         }
       },
     },
-    './proxy/customRequest': { stopCustomRequests: vi.fn() },
+    './proxy/customRequest': customRequest,
     './modelStore': { readModelConfig: () => models },
     './schemaValidator': { validateCustomModel: () => ({ valid: true }) },
     './cryptoStore': {
@@ -161,6 +164,152 @@ function post(url: string, body: string, chunked: boolean) {
     } else request.end(body);
   });
 }
+
+describe('OpenAI tool reasoning through the desktop HTTP proxy', () => {
+  it.each([false, true])(
+    'replays reasoning with a tool result without exposing it as content (stream=%s)',
+    async (stream) => {
+      const reasoning = 'Inspect the fixture before answering. Keep this analysis with the tool call.';
+      const visible = 'I will read the fixture.';
+      const toolCall = {
+        id: 'reasoning-replay-call',
+        type: 'function',
+        function: { name: 'fixture_read', arguments: JSON.stringify({ path: '/fixture.txt' }) },
+      };
+      const received: {
+        path: string;
+        body: { model: string; stream: boolean; messages: Record<string, unknown>[] };
+      }[] = [];
+      const upstream = await serve((req, res) => {
+        const chunks: Buffer[] = [];
+        req.on('data', (chunk: Buffer) => chunks.push(chunk));
+        req.on('end', () => {
+          received.push({ path: req.url || '', body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+          const firstTurn = received.length === 1;
+          if (stream) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            const deltas = firstTurn
+              ? [
+                  { delta: { reasoning_content: reasoning } },
+                  { delta: { content: visible } },
+                  { delta: { tool_calls: [{ index: 0, ...toolCall }] }, finish_reason: 'tool_calls' },
+                ]
+              : [{ delta: { content: 'Fixture read successfully.' }, finish_reason: 'stop' }];
+            for (const choice of deltas) res.write(`data: ${JSON.stringify({ choices: [choice] })}\n\n`);
+            res.end('data: [DONE]\n\n');
+          } else {
+            res.setHeader('Content-Type', 'application/json');
+            res.end(
+              JSON.stringify({
+                choices: [
+                  {
+                    message: firstTurn
+                      ? { role: 'assistant', content: visible, reasoning_content: reasoning, tool_calls: [toolCall] }
+                      : { role: 'assistant', content: 'Fixture read successfully.' },
+                    finish_reason: firstTurn ? 'tool_calls' : 'stop',
+                  },
+                ],
+              }),
+            );
+          }
+        });
+      });
+      const modelName = 'models/reasoning-replay-fixture';
+      const proxy = await fixture(upstream, false, undefined, undefined, [
+        {
+          name: modelName,
+          displayName: 'Reasoning replay fixture',
+          description: '',
+          provider: 'openai',
+          apiKey: 'local-fixture-key',
+          encrypted: true,
+          apiUrl: upstream,
+          externalModelName: 'reasoning-fixture',
+          maxRetries: 0,
+        },
+      ]);
+      const endpoint = `${proxy.url}/v1beta/${modelName}:${stream ? 'streamGenerateContent' : 'generateContent'}`;
+      const user = { role: 'user', parts: [{ text: 'Read the fixture, then answer.' }] };
+      const tools = [
+        {
+          functionDeclarations: [
+            {
+              name: 'fixture_read',
+              parameters: { type: 'OBJECT', properties: { path: { type: 'STRING' } }, required: ['path'] },
+            },
+          ],
+        },
+      ];
+      const first = await post(endpoint, JSON.stringify({ contents: [user], tools }), false);
+      expect(first.status).toBe(200);
+      type Part = { text?: string; thought?: boolean; functionCall?: { id: string; name: string; args: unknown } };
+      type Reply = { candidates: { content: { parts: Part[] } }[] };
+      const replies: Reply[] = stream
+        ? first.body
+            .toString('utf8')
+            .split('\n')
+            .filter((line) => line.startsWith('data: '))
+            .map((line) => JSON.parse(line.slice(6)))
+        : [JSON.parse(first.body.toString('utf8'))];
+      const parts = replies.flatMap((reply) => reply.candidates.flatMap((candidate) => candidate.content.parts));
+      expect(
+        parts
+          .filter((part) => part.thought)
+          .map((part) => part.text)
+          .join(''),
+      ).toBe(reasoning);
+      expect(
+        parts
+          .filter((part) => !part.thought && part.text)
+          .map((part) => part.text)
+          .join(''),
+      ).toBe(visible);
+      expect(parts.filter((part) => part.functionCall)).toEqual([
+        {
+          functionCall: {
+            id: toolCall.id,
+            name: toolCall.function.name,
+            args: { path: '/fixture.txt' },
+          },
+        },
+      ]);
+      const toolResult = { content: 'fixture file content' };
+      const replay = await post(
+        endpoint,
+        JSON.stringify({
+          contents: [
+            user,
+            { role: 'model', parts },
+            {
+              role: 'user',
+              parts: [
+                {
+                  functionResponse: {
+                    id: toolCall.id,
+                    name: toolCall.function.name,
+                    response: toolResult,
+                  },
+                },
+              ],
+            },
+          ],
+          tools,
+        }),
+        true,
+      );
+      expect(replay.status).toBe(200);
+      expect(replay.body.toString('utf8')).toContain('Fixture read successfully.');
+      expect(received).toHaveLength(2);
+      expect(received.map((request) => request.path)).toEqual(['/v1/chat/completions', '/v1/chat/completions']);
+      expect(received[1].body).toMatchObject({ model: 'reasoning-fixture', stream });
+      expect(received[1].body.messages).toEqual([
+        { role: 'user', content: 'Read the fixture, then answer.' },
+        { role: 'assistant', content: visible, reasoning_content: reasoning, tool_calls: [toolCall] },
+        { role: 'tool', content: JSON.stringify(toolResult), tool_call_id: toolCall.id },
+      ]);
+    },
+  );
+});
 
 describe('buffered Google metadata forwarding', () => {
   it('attributes native quota only to a matching saved credential and its actual request scope', async () => {

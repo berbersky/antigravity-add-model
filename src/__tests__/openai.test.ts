@@ -166,6 +166,7 @@ describe('mapGeminiToOpenAI', () => {
       'external-model',
     );
     expect(result.messages[0].content).toBe('The previous write failed. Retrying with the corrected path.');
+    expect(result.messages[0].reasoning_content).toBe('Internal reasoning');
     expect(result.messages[0].tool_calls).toEqual([
       {
         id: 'retry-write',
@@ -173,6 +174,59 @@ describe('mapGeminiToOpenAI', () => {
         function: { name: 'write_to_file', arguments: '{"TargetFile":"/tmp/retry.txt"}' },
       },
     ]);
+  });
+
+  it.each([false, true])('replays each tool turn\'s own reasoning after results (parallel: %s)', (parallel) => {
+    const firstCalls = [
+      { functionCall: { name: 'inspect_file', id: 'inspect-a', args: { path: 'a.txt' } } },
+      ...(parallel ? [{ functionCall: { name: 'inspect_file', id: 'inspect-b', args: { path: 'b.txt' } } }] : []),
+    ];
+    const body = {
+      contents: [
+        { role: 'user', parts: [{ text: 'Compare the files, then verify the result.' }] },
+        {
+          role: 'model',
+          parts: [{ text: 'Inspect first. ', thought: true }, ...firstCalls, { text: 'Then compare.', thought: true }],
+        },
+        {
+          role: 'user',
+          parts: firstCalls.map(({ functionCall }) => ({
+            functionResponse: { name: functionCall.name, id: functionCall.id, response: { exists: true } },
+          })),
+        },
+        {
+          role: 'model',
+          parts: [
+            { text: 'The files match. ', thought: true },
+            { text: 'Verifying the comparison.' },
+            { functionCall: { name: 'verify_result', id: 'verify-1', args: { expected: 'match' } } },
+            { text: 'Confirm before finishing.', thought: true },
+          ],
+        },
+        {
+          role: 'user',
+          parts: [{ functionResponse: { name: 'verify_result', id: 'verify-1', response: { verified: true } } }],
+        },
+      ],
+      tools: [{ functionDeclarations: [{ name: 'inspect_file' }, { name: 'verify_result' }] }],
+    };
+    const original = structuredClone(body);
+    shared.modelReasoningContent.set('other-conversation', 'Unrelated reasoning must not be replayed.');
+    const result = mapGeminiToOpenAI(body, 'reasoning-provider', 'this-conversation');
+    const assistants = result.messages.filter((message) => message.role === 'assistant');
+    expect(assistants.map((message) => message.reasoning_content)).toEqual([
+      'Inspect first. Then compare.',
+      'The files match. Confirm before finishing.',
+    ]);
+    expect(assistants.map((message) => message.content)).toEqual([null, 'Verifying the comparison.']);
+    expect(assistants.flatMap((message) => message.tool_calls!.map((call) => call.id))).toEqual([
+      ...firstCalls.map(({ functionCall }) => functionCall.id), 'verify-1',
+    ]);
+    expect(result.messages.filter((message) => message.role === 'tool').map((message) => message.tool_call_id))
+      .toEqual([...firstCalls.map(({ functionCall }) => functionCall.id), 'verify-1']);
+    expect(result.messages).toHaveLength(parallel ? 6 : 5);
+    expect(result.tools!.map((tool) => tool.function.name)).toEqual(['inspect_file', 'verify_result']);
+    expect(body).toEqual(original);
   });
 
   it.each([false, true])('keeps tool failure text after all matching tool results (split items: %s)', (splitItems) => {
@@ -462,6 +516,39 @@ describe('mapOpenAIToGemini', () => {
     expect(result.candidates[0].finishReason).toBe('STOP');
     const fcParts = result.candidates[0].content.parts.filter((p) => p.functionCall);
     expect(fcParts.length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ['reasoning_content', false],
+    ['reasoning', false],
+    ['reasoning_content', true],
+    ['reasoning', true],
+  ] as const)('round-trips %s through a nonstream tool response (DSML: %s)', (field, dsml) => {
+    const message = {
+      [field]: 'After inspecting the file, verify its checksum.',
+      content: dsml
+        ? 'Inspecting.\n<DSML|invoke name="inspect_file"><DSML|parameter name="path" string="true">a.txt</DSML|parameter></DSML|invoke>'
+        : 'Inspecting.',
+      ...(!dsml ? { tool_calls: [{
+        id: 'inspect-response', type: 'function' as const,
+        function: { name: 'inspect_file', arguments: '{"path":"a.txt"}' },
+      }] } : {}),
+    };
+    const response = { choices: [{ message, finish_reason: dsml ? 'stop' : 'tool_calls' }] };
+    const original = structuredClone(response);
+    const native = mapOpenAIToGemini(response, 'reasoning-provider').candidates[0];
+    expect(native.content.parts.filter((part) => part.thought)).toEqual([
+      { text: 'After inspecting the file, verify its checksum.', thought: true },
+    ]);
+    const toolPart = native.content.parts.find((part) => part.functionCall)!;
+    expect(toolPart.functionCall).toMatchObject({ name: 'inspect_file', args: { path: 'a.txt' } });
+    if (!dsml) expect(toolPart.functionCall!.id).toBe('inspect-response');
+    expect(native.finishReason).toBe('STOP');
+    const replay = mapGeminiToOpenAI({ contents: [native.content] }, 'reasoning-provider').messages[0];
+    expect(replay.reasoning_content).toBe(message[field]);
+    expect(replay.content).toBe('Inspecting.');
+    expect(replay.tool_calls![0].function).toEqual({ name: 'inspect_file', arguments: '{"path":"a.txt"}' });
+    expect(response).toEqual(original);
   });
 
   it('should include reasoning_content as thought part', () => {
