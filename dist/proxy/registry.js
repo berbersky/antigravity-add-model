@@ -45,6 +45,7 @@ const openai = __importStar(require("./translators/openai"));
 const anthropic = __importStar(require("./translators/anthropic"));
 const google = __importStar(require("./translators/google"));
 const providers_1 = require("../providers");
+const artifactMetadata_1 = require("./artifactMetadata");
 function getTranslator(provider, apiFormat) {
     const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
     return format === 'google' ? google : format === 'anthropic' ? anthropic : openai;
@@ -57,21 +58,24 @@ function translateRequest(provider, body, modelName, apiFormat, stateKey) {
         return anthropic.mapGeminiToAnthropic(body, modelName, stateKey);
     return openai.mapGeminiToOpenAI(body, modelName, stateKey);
 }
-function translateResponse(provider, response, stateKey, apiFormat, toolSchemas) {
+function translateResponse(provider, response, stateKey, apiFormat, toolSchemas, artifactContext) {
     const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
-    if (format === 'google')
-        return google.mapGoogleToGemini(response, stateKey);
-    if (format === 'anthropic')
-        return anthropic.mapAnthropicToGemini(response, stateKey, toolSchemas);
-    return openai.mapOpenAIToGemini(response, stateKey, toolSchemas);
+    const mapped = format === 'google'
+        ? google.mapGoogleToGemini(response, stateKey)
+        : format === 'anthropic'
+            ? anthropic.mapAnthropicToGemini(response, stateKey, toolSchemas)
+            : openai.mapOpenAIToGemini(response, stateKey, toolSchemas);
+    return (0, artifactMetadata_1.normalizeArtifactResponse)(mapped, artifactContext);
 }
-function translateStreamChunk(provider, chunk, stateKey, apiFormat, streamKey, toolSchemas) {
+function translateStreamChunk(provider, chunk, stateKey, apiFormat, streamKey, toolSchemas, artifactContext) {
     const format = (0, providers_1.resolveApiFormat)(provider, apiFormat);
-    if (format === 'google')
-        return google.mapGoogleChunkToGemini(chunk, stateKey);
-    if (format === 'anthropic')
-        return anthropic.mapAnthropicChunkToGemini(chunk, stateKey, streamKey, toolSchemas);
-    return openai.mapOpenAIChunkToGemini(chunk, stateKey, streamKey, toolSchemas);
+    const mapped = format === 'google'
+        ? google.mapGoogleChunkToGemini(chunk, stateKey)
+        : format === 'anthropic'
+            ? anthropic.mapAnthropicChunkToGemini(chunk, stateKey, streamKey, toolSchemas)
+            : openai.mapOpenAIChunkToGemini(chunk, stateKey, streamKey, toolSchemas);
+    // Normalize before customRequest records reasoning against the emitted arguments.
+    return (0, artifactMetadata_1.normalizeArtifactCandidate)(mapped, artifactContext);
 }
 function getProviderHeaders(provider, apiKey = '', apiFormat, apiUrl = '') {
     const headers = { 'Content-Type': 'application/json' };

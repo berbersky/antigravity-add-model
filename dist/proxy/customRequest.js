@@ -51,6 +51,7 @@ const circuitBreaker_1 = require("./circuitBreaker");
 const requestOptions_1 = require("./requestOptions");
 const shared_1 = require("./shared");
 const utils_1 = require("./translators/utils");
+const artifactMetadata_1 = require("./artifactMetadata");
 const subagentRouting_1 = require("./subagentRouting");
 const subagentModels_1 = require("./subagentModels");
 const googlePoolFailover_1 = require("./googlePoolFailover");
@@ -242,6 +243,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
     // must preserve the primary model's choice for this compaction operation.
     const compactionEffort = (0, requestOptions_1.isAntigravityCompactionRequest)(originalBody) ? primary.compactionReasoningEffort : undefined;
     const toolSchemas = (0, utils_1.collectToolSchemas)(originalBody);
+    const artifactContext = (0, artifactMetadata_1.collectArtifactContext)(originalBody, toolSchemas);
     const controller = new AbortController();
     const { signal } = controller;
     const requestId = (0, crypto_1.randomUUID)();
@@ -501,7 +503,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                                 for (const args of completed.values())
                                     validateToolArguments(args);
                             }
-                            const mapped = registry.translateStreamChunk(model.provider, chunk, stateKey, format, stateKey, toolSchemas);
+                            const mapped = registry.translateStreamChunk(model.provider, chunk, stateKey, format, stateKey, toolSchemas, artifactContext);
                             if (mapped) {
                                 if (format === 'openai')
                                     observeCandidate(mapped);
@@ -576,7 +578,7 @@ async function runCustomModelRequest(res, primary, originalBody, isStream, allMo
                                 validateToolArguments(tool.function?.arguments);
                         }
                         // Some compatible endpoints return a complete JSON response even when stream=true.
-                        const mapped = registry.translateResponse(model.provider, parsed, stateKey, format, toolSchemas);
+                        const mapped = registry.translateResponse(model.provider, parsed, stateKey, format, toolSchemas, artifactContext);
                         if (!mapped?.candidates?.length)
                             throw new UpstreamError('Upstream returned no candidates.');
                         if (format === 'openai')

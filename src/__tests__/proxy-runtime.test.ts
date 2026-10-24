@@ -12,6 +12,7 @@ import { getProvider, PROVIDERS, resolveApiFormat } from '../providers';
 import { validateCustomModel } from '../schemaValidator';
 import { getGooglePoolStatus, resetGoogleAccountState } from '../googleAccounts';
 import { clearDiagnostics, getDiagnostics } from '../diagnostics';
+import type { GeminiBody } from '../proxy/requestOptions';
 
 vi.mock('electron-log', () => ({ default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
 const servers: http.Server[] = [];
@@ -75,11 +76,26 @@ const sse = (res: http.ServerResponse, value: unknown) =>
 
 function toolReply(
   res: http.ServerResponse,
-  provider: 'openai' | 'anthropic',
+  provider: 'openai' | 'anthropic' | 'google',
   stream: boolean,
   name: string,
   args: Record<string, unknown>,
 ) {
+  if (provider === 'google') {
+    const reply = {
+      candidates: [
+        {
+          content: { role: 'model', parts: [{ functionCall: { id: 'shared-call', name, args } }] },
+          finishReason: 'STOP',
+        },
+      ],
+    };
+    res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
+    if (stream) sse(res, reply);
+    else res.write(JSON.stringify(reply));
+    res.end();
+    return;
+  }
   if (!stream) {
     res.setHeader('Content-Type', 'application/json');
     res.end(
@@ -156,7 +172,199 @@ async function readToolCalls(response: Response, stream: boolean) {
     .flatMap((part) => (part.functionCall ? [part.functionCall] : []));
 }
 
+// Native IDE context and optional artifact schema, reduced to the relevant fields.
+function artifactRequest(workspace = 'C:\\repo', artifactRoot = 'C:\\profile\\brain\\conversation'): GeminiBody {
+  return {
+    sessionId: 'artifact-session',
+    contents: [{ role: 'user', parts: [{ text: 'Create the requested file.' }] }],
+    systemInstruction: {
+      parts: [
+        {
+          text: [
+            'The user has 1 active workspaces, each defined by a URI and a CorpusName. Multiple URIs potentially map to the same CorpusName. The mapping is shown as follows in the format [URI] -> [CorpusName]:',
+            `${workspace} -> fixture/repository`,
+            '',
+            '<artifacts>',
+            `Artifact Directory Path: ${artifactRoot}`,
+            '</artifacts>',
+          ].join('\n'),
+        },
+      ],
+    },
+    tools: [
+      {
+        functionDeclarations: [
+          {
+            name: 'write_to_file',
+            description:
+              'Use this tool to create new files. When creating an artifact, always provide an ArtifactMetadata.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                TargetFile: { type: 'STRING' },
+                CodeContent: { type: 'STRING' },
+                Overwrite: { type: 'BOOLEAN' },
+                Description: { type: 'STRING' },
+                toolSummary: { type: 'STRING' },
+                toolAction: { type: 'STRING' },
+                ArtifactMetadata: {
+                  type: 'OBJECT',
+                  description: 'Metadata that defines artifact properties. Required when creating an artifact file.',
+                  properties: {
+                    Summary: { type: 'STRING' },
+                    UserFacing: { type: 'BOOLEAN' },
+                    RequestFeedback: { type: 'BOOLEAN' },
+                  },
+                  required: ['Summary', 'UserFacing', 'RequestFeedback'],
+                },
+              },
+              required: ['TargetFile', 'CodeContent', 'Overwrite', 'Description', 'toolSummary', 'toolAction'],
+            },
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function artifactWriteArgs(target = 'C:\\repo\\result.txt') {
+  return {
+    TargetFile: target,
+    CodeContent: 'verified result',
+    Overwrite: false,
+    Description: 'Save the requested result.',
+    toolAction: 'Writing result',
+    toolSummary: 'Fixture result',
+    ArtifactMetadata: { Summary: 'Result', UserFacing: false, RequestFeedback: false },
+  };
+}
+
 describe('real upstream HTTP routing', () => {
+  describe.each(['openai', 'anthropic', 'google'] as const)('%s native artifact metadata', (provider) => {
+    it.each([
+      { stream: false, upstreamStream: false, target: 'C:\\repo\\result.txt', ordinary: true },
+      { stream: true, upstreamStream: true, target: 'C:\\repo\\result.txt', ordinary: true },
+      { stream: true, upstreamStream: false, target: 'C:\\repo\\result.txt', ordinary: true },
+      { stream: false, upstreamStream: false, target: 'C:\\profile\\brain\\conversation\\plan.md', ordinary: false },
+      { stream: true, upstreamStream: true, target: 'C:\\profile\\brain\\conversation\\plan.md', ordinary: false },
+      { stream: true, upstreamStream: false, target: 'C:\\profile\\brain\\conversation\\plan.md', ordinary: false },
+    ])(
+      'handles metadata for $target (client stream=$stream, upstream stream=$upstreamStream)',
+      async ({ stream, upstreamStream, target, ordinary }) => {
+        const args = artifactWriteArgs(target);
+        const upstream = await serve((_req, res) => toolReply(res, provider, upstreamStream, 'write_to_file', args));
+        const configured = model(upstream, { provider });
+        const request = artifactRequest();
+        const before = structuredClone(request);
+        const url = await serve(
+          (_req, res) => void runCustomModelRequest(res, configured, request, stream, [configured], false),
+        );
+        const response = await fetch(url);
+        expect(response.status).toBe(200);
+        const expected: Record<string, unknown> = { ...args };
+        if (ordinary) delete expected.ArtifactMetadata;
+        expect(await readToolCalls(response, stream)).toEqual([
+          { id: 'shared-call', name: 'write_to_file', args: expected },
+        ]);
+        expect(request).toEqual(before);
+      },
+    );
+  });
+
+  it.each([false, true])(
+    'replays reasoning for the corrected call on the next native turn (stream=%s)',
+    async (stream) => {
+      const args = artifactWriteArgs();
+      const reasoning = 'Retain the verified result and read it back after saving.';
+      const captured: {
+        messages: {
+          role: string;
+          reasoning_content?: string;
+          tool_call_id?: string;
+          tool_calls?: { id: string; function: { name: string; arguments: string } }[];
+        }[];
+      }[] = [];
+      const upstream = await serve(async (req, res) => {
+        captured.push(await body(req));
+        if (captured.length > 1) return success(res, 'continued');
+        const call = {
+          id: 'artifact-call',
+          type: 'function',
+          function: { name: 'write_to_file', arguments: JSON.stringify(args) },
+        };
+        res.setHeader('Content-Type', stream ? 'text/event-stream' : 'application/json');
+        if (stream) {
+          sse(res, { choices: [{ delta: { reasoning_content: reasoning }, finish_reason: null }] });
+          sse(res, { choices: [{ delta: { tool_calls: [{ index: 0, ...call }] }, finish_reason: 'tool_calls' }] });
+          sse(res, '[DONE]');
+        } else {
+          res.write(
+            JSON.stringify({
+              choices: [{ message: { reasoning_content: reasoning, tool_calls: [call] }, finish_reason: 'tool_calls' }],
+            }),
+          );
+        }
+        res.end();
+      });
+      const configured = model(upstream);
+      const url = await serve(async (req, res) => {
+        void runCustomModelRequest(res, configured, await body(req), stream, [configured], false);
+      });
+      const request = artifactRequest();
+      const first = await fetch(url, { method: 'POST', body: JSON.stringify(request) });
+      expect(first.status).toBe(200);
+      const [call] = await readToolCalls(first, stream);
+      expect(call.args).not.toHaveProperty('ArtifactMetadata');
+      const continuation = {
+        ...request,
+        contents: [
+          ...request.contents!,
+          { role: 'model', parts: [{ functionCall: call }] },
+          {
+            role: 'user',
+            parts: [{ functionResponse: { id: call.id, name: call.name, response: { result: 'File saved.' } } }],
+          },
+        ],
+      };
+      const next = await fetch(url, { method: 'POST', body: JSON.stringify(continuation) });
+      expect(next.status).toBe(200);
+      expect(await next.text()).toContain('continued');
+      const assistant = captured[1].messages.find((message) => message.role === 'assistant');
+      const result = captured[1].messages.find((message) => message.role === 'tool');
+      expect(assistant?.reasoning_content).toBe(reasoning);
+      const replayedCall = assistant?.tool_calls?.[0];
+      expect(replayedCall?.id).toBe(call.id);
+      expect(JSON.parse(replayedCall!.function.arguments)).toEqual(call.args);
+      expect(result?.tool_call_id).toBe(call.id);
+    },
+  );
+
+  it('isolates artifact roots across simultaneous requests on the same model', async () => {
+    const pending: http.ServerResponse[] = [];
+    const args = artifactWriteArgs('C:\\repo\\artifacts\\plan.md');
+    const upstream = await serve((_req, res) => {
+      pending.push(res);
+      if (pending.length === 2)
+        for (const response of pending.reverse()) toolReply(response, 'openai', true, 'write_to_file', args);
+    });
+    const configured = model(upstream);
+    const url = await serve(async (req, res) => {
+      void runCustomModelRequest(res, configured, await body(req), true, [configured], false);
+    });
+    const responses = await Promise.all(
+      [
+        artifactRequest('C:\\repo', 'C:\\profile\\brain\\conversation'),
+        artifactRequest('C:\\repo', 'C:\\repo\\artifacts'),
+      ].map(async (request) => {
+        const response = await fetch(url, { method: 'POST', body: JSON.stringify(request) });
+        expect(response.status).toBe(200);
+        return readToolCalls(response, true);
+      }),
+    );
+    expect(responses[0][0].args).not.toHaveProperty('ArtifactMetadata');
+    expect(responses[1][0].args).toEqual(args);
+  });
+
   describe('terminal OpenAI tool frames', () => {
     it.each([
       { name: 'ordinary less-than sign', content: '2 <', text: '2 <', calls: [] },

@@ -42,6 +42,7 @@ export const REQUIRED_BUILD_FILES = [
   'proxy/shared.js',
   'proxy/customRequest.js',
   'proxy/reasoningReplay.js',
+  'proxy/artifactMetadata.js',
   'proxy/googlePoolFailover.js',
   'proxy/subagentRouting.js',
   'proxy/subagentModels.js',

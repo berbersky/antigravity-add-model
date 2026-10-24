@@ -116,6 +116,20 @@ accounts. Native quota failover, OAuth reconnect, cancellation and interrupted
 streams are covered by automated tests; a two-account live Google quota
 exhaustion scenario was not exercised in this session.
 
+## Workspace files and artifacts
+
+Custom models sometimes attach `ArtifactMetadata` to an ordinary workspace file,
+causing the IDE to reject it as an invalid artifact path. The proxy now removes
+that optional field automatically when the current native tool schema and IDE
+context identify a workspace file outside the conversation's artifact directory.
+No manual reminder to the model is needed for these recognized calls.
+
+Real artifact metadata is preserved. Unknown tool schemas, missing or conflicting
+context, relative or ambiguous paths, and files outside the declared workspaces
+are passed through unchanged for the IDE to validate. This does not change file
+permissions or the requested target, contents or overwrite behavior. See the
+[real IDE test results](verification-artifact-metadata.md).
+
 ## Native model identities and capacity
 
 IDE 2.5.5 builds its native picker from the Cloud Code model catalog and its

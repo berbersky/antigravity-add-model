@@ -2,6 +2,12 @@
 
 Release history preserved from the project README. Historical entries describe the behavior of their release; see [compatibility and recovery](docs/compatibility.md) for current installation guidance.
 
+### Unreleased — Automatic workspace artifact metadata correction
+
+- Prevent custom models from classifying ordinary workspace files as artifacts by sending optional `ArtifactMetadata`. Use the current native IDE workspace paths, artifact directory and tool schema to remove the misplaced field before execution, without changing the requested path, contents or overwrite setting. Genuine artifact calls and ambiguous/custom contexts remain unchanged.
+- Apply the correction to OpenAI, Anthropic and Google response formats, including streaming and JSON fallback. Record reasoning against the corrected tool arguments so the next tool turn can still recover its history. Include the new module in standalone deployment.
+- Verify on Windows Antigravity IDE 2.5.5 with a real OpenRouter model: normal file creation/editing, genuine artifact creation, and a deliberately malformed metadata call corrected automatically on its first attempt. All 1,607 tests pass (two existing skips); see [live verification](docs/verification-artifact-metadata.md).
+
 ### Unreleased — Dependency security updates
 
 - Upgrade Chrome DevTools MCP to 1.12.0, Electron Updater to 6.8.11 and Vitest to 4.1.12. Refresh vulnerable transitive dependencies, including the updater's redirect handling, HTTP request parsing, YAML/URI parsing, and the test/build toolchain.

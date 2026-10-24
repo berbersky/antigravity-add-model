@@ -4,6 +4,7 @@ import * as anthropic from './translators/anthropic';
 import * as google from './translators/google';
 import { ApiFormat, isOpencodeEndpoint, OPENCODE_USER_AGENT, resolveApiFormat } from '../providers';
 import type { ToolSchemas } from './translators/utils';
+import { normalizeArtifactCandidate, normalizeArtifactResponse, type ArtifactContext } from './artifactMetadata';
 
 export interface TranslatorModule {
   [key: string]: unknown;
@@ -37,11 +38,16 @@ export function translateResponse(
   stateKey: string,
   apiFormat?: ApiFormat,
   toolSchemas?: ToolSchemas,
+  artifactContext?: ArtifactContext,
 ): unknown {
   const format = resolveApiFormat(provider, apiFormat);
-  if (format === 'google') return google.mapGoogleToGemini(response, stateKey);
-  if (format === 'anthropic') return anthropic.mapAnthropicToGemini(response as never, stateKey, toolSchemas);
-  return openai.mapOpenAIToGemini(response as never, stateKey, toolSchemas);
+  const mapped =
+    format === 'google'
+      ? google.mapGoogleToGemini(response, stateKey)
+      : format === 'anthropic'
+        ? anthropic.mapAnthropicToGemini(response as never, stateKey, toolSchemas)
+        : openai.mapOpenAIToGemini(response as never, stateKey, toolSchemas);
+  return normalizeArtifactResponse(mapped, artifactContext);
 }
 
 export function translateStreamChunk(
@@ -51,12 +57,17 @@ export function translateStreamChunk(
   apiFormat?: ApiFormat,
   streamKey?: string,
   toolSchemas?: ToolSchemas,
+  artifactContext?: ArtifactContext,
 ): unknown {
   const format = resolveApiFormat(provider, apiFormat);
-  if (format === 'google') return google.mapGoogleChunkToGemini(chunk, stateKey);
-  if (format === 'anthropic')
-    return anthropic.mapAnthropicChunkToGemini(chunk as never, stateKey, streamKey, toolSchemas);
-  return openai.mapOpenAIChunkToGemini(chunk as never, stateKey, streamKey, toolSchemas);
+  const mapped =
+    format === 'google'
+      ? google.mapGoogleChunkToGemini(chunk, stateKey)
+      : format === 'anthropic'
+        ? anthropic.mapAnthropicChunkToGemini(chunk as never, stateKey, streamKey, toolSchemas)
+        : openai.mapOpenAIChunkToGemini(chunk as never, stateKey, streamKey, toolSchemas);
+  // Normalize before customRequest records reasoning against the emitted arguments.
+  return normalizeArtifactCandidate(mapped, artifactContext);
 }
 
 export function getProviderHeaders(provider: string, apiKey = '', apiFormat?: ApiFormat, apiUrl = ''): ProviderHeaders {

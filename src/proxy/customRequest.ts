@@ -25,6 +25,7 @@ import {
 } from './requestOptions';
 import { activeStreamContexts, modelReasoningContent, modelToolCallIds, stateTimestamps } from './shared';
 import { collectToolSchemas } from './translators/utils';
+import { collectArtifactContext } from './artifactMetadata';
 import { subagentRouting, SubagentRoutingError } from './subagentRouting';
 import { resolveConfiguredSubagentModel } from './subagentModels';
 import { isGoogleQuotaFailure } from './googlePoolFailover';
@@ -226,6 +227,7 @@ export async function runCustomModelRequest(
   // must preserve the primary model's choice for this compaction operation.
   const compactionEffort = isAntigravityCompactionRequest(originalBody) ? primary.compactionReasoningEffort : undefined;
   const toolSchemas = collectToolSchemas(originalBody);
+  const artifactContext = collectArtifactContext(originalBody, toolSchemas);
   const controller = new AbortController();
   const { signal } = controller;
   const requestId = randomUUID();
@@ -528,6 +530,7 @@ export async function runCustomModelRequest(
                 format,
                 stateKey,
                 toolSchemas,
+                artifactContext,
               ) as {
                 content?: { parts?: unknown[] };
                 finishReason?: string;
@@ -591,7 +594,14 @@ export async function runCustomModelRequest(
               for (const tool of parsed.choices[0].message.tool_calls) validateToolArguments(tool.function?.arguments);
             }
             // Some compatible endpoints return a complete JSON response even when stream=true.
-            const mapped = registry.translateResponse(model.provider, parsed, stateKey, format, toolSchemas) as {
+            const mapped = registry.translateResponse(
+              model.provider,
+              parsed,
+              stateKey,
+              format,
+              toolSchemas,
+              artifactContext,
+            ) as {
               candidates?: unknown[];
             };
             if (!mapped?.candidates?.length) throw new UpstreamError('Upstream returned no candidates.');
