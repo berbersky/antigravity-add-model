@@ -2,6 +2,12 @@
 
 Release history preserved from the project README. Historical entries describe the behavior of their release; see [compatibility and recovery](docs/compatibility.md) for current installation guidance.
 
+### Unreleased — Dependency security updates
+
+- Upgrade Chrome DevTools MCP to 1.12.0, Electron Updater to 6.8.11 and Vitest to 4.1.12. Refresh vulnerable transitive dependencies, including the updater's redirect handling, HTTP request parsing, YAML/URI parsing, and the test/build toolchain.
+- Upgrade the optional gateway's Undici HTTP client to 7.30.1 and raise its minimum supported dependency version. Keep reproducible lockfiles for both installations.
+- On 2026-10-24, `npm audit` reports zero known vulnerabilities for both the main project (including development dependencies) and the gateway, down from 14 and 1 affected package records respectively. Clean installs, both builds, 1,537 main-project tests, 242 gateway tests and the desktop-to-gateway integration check pass; two existing main-project tests remain skipped.
+
 ### Unreleased — Preserve reasoning across tool calls
 
 - Address the reasoning loss reported in [PR #29](https://github.com/vahapogut/antigravity-add-model/pull/29): use one assistant-message mapping for normal and tool-call history so each turn retains its own `reasoning_content`, separate from visible text. Preserve tool identifiers, arguments, results and message order.
