@@ -1,4 +1,8 @@
 import { describe, expect, it } from 'vitest';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import ts from 'typescript';
 import {
   ORIGINAL_LANGUAGE_SERVER_URL,
   PATCHED_LANGUAGE_SERVER_URL,
@@ -20,6 +24,18 @@ function occurrences(buffer: Buffer, needle: Buffer): number {
 }
 
 describe('typed Windows language-server endpoint patch planner', () => {
+  it('keeps the bootstrap module generated from the TypeScript source', () => {
+    const directory = path.dirname(fileURLToPath(import.meta.url));
+    const sourcePath = path.resolve(directory, '../../scripts/language-server-binary-patch.ts');
+    const outputPath = path.resolve(directory, '../../scripts/language-server-binary-patch.mjs');
+    const generated = ts.transpileModule(fs.readFileSync(sourcePath, 'utf8'), {
+      fileName: sourcePath,
+      compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
+    }).outputText;
+    const expected = generated.endsWith('\n') ? generated : `${generated}\n`;
+    expect(fs.readFileSync(outputPath, 'utf8')).toBe(expected);
+  });
+
   it('keeps the binary URL replacement equal-length', () => {
     expect(ORIGINAL_LANGUAGE_SERVER_URL.length).toBe(PATCHED_LANGUAGE_SERVER_URL.length);
   });
